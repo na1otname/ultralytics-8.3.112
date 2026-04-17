@@ -60,6 +60,57 @@ class AFSSManager:
         M1 = max(0, int(0.4 * len(moderate_pool)) - len(forced_mod))
         if M1 > 0 and remain_mod:
             omega.update(random.sample(remain_mod, min(M1, len(remain_mod))))
+        
+        # 4. Easy 样本持续复习 (距离上次超过10轮的强制加入)
+        forced_easy = [img for img in easy_pool if current_epoch - 1 - self.state_dict[img]['ep'] >= 10]
+        # 强制加入的数量最多只能占 easy 样本的 1%(0.5 × 2%)
+        max_forced_easy = int(0.5 * 0.02 * len(easy_pool))
+        if len(forced_easy) > max_forced_easy:
+            forced_easy = random.sample(forced_easy, max_forced_easy)
+        omega.update(forced_easy)
+        
+        # easy额外采样数E2, 总共只希望 2% 的easy样本参与训练, E2 = 2% 总量 - 已强制数量(遗忘掉了的easy样本, 最多只有1%)
+        remain_easy = list(set(easy_pool) - set(forced_easy))
+        E2 = max(0, int(0.02 * len(easy_pool)) - len(forced_easy))
+        if E2 > 0 and remain_easy:
+            omega.update(random.sample(remain_easy, min(E2, len(remain_easy))))
+        
+        # 5. 更新参与本轮训练的样本的记录
+        # omega是用于强制完整训练的训练集样本, 需要被更新到current_epoch
+        for img_id in omega:
+            self.state_dict[img_id]['ep'] = current_epoch
+            
+        return list(omega)
+    
+    def print_sufficiency_distribution(self):
+        """统计并打印当前数据集的学习充分度分布 (Easy/Moderate/Hard)"""
+        easy_count, mod_count, hard_count = 0, 0, 0
+        for state in self.state_dict.values():
+            suff = min(state['P'], state['R'])
+            if suff > 0.85:
+                easy_count += 1
+            elif 0.55 <= suff <= 0.85:
+                mod_count += 1
+            else:
+                hard_count += 1
+        
+        total = len(self.state_dict)
+        if total == 0:
+            print("  AFSS State Dict is empty!")
+            return
+        
+        print(f"  -> Easy     (>0.85): {easy_count:5d} / {total} ({easy_count/total*100:.1f}%)")
+        print(f"  -> Moderate (0.55-0.85): {mod_count:5d} / {total} ({mod_count/total*100:.1f}%)")
+        print(f"  -> Hard     (<0.55): {hard_count:5d} / {total} ({hard_count/total*100:.1f}%)")
+        print("-" * 60)
+
+    # 利用验证集的无增强DataLoader对全体训练集做一次快速推断, 更新state_dict中的P, R记录, 跨5个epochs更新一次
+    # 全体训练集边推理边计算, 效率不高, 但可以实时监控模型在训练集上的学习进度, 所以设置5epochs做一次更新
+    @torch.no_grad()
+    def evaluate_and_update(self, 
+                            model,
+                            ):
+        pass
 
 
 
