@@ -5,7 +5,7 @@ import torch
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 # 加载模型并移动到 GPU
-model = YOLO(r'F:\work\Porject\SLS\model\detection\best.pt').to(device)
+model = YOLO(r'F:\work\Porject\SLS\model\detection\SLS_BJ_HandPhone_Detect_v8s_20260420\weights\best.pt').to(device)
 
 # 执行导出
 results = model.export(

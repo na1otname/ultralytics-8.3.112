@@ -58,7 +58,7 @@ runs/
 # Translations
 *.mo
 *.pot
-
+export.py
 # Django stuff:
 *.log
 local_settings.py

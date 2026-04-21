@@ -10,6 +10,7 @@ from .dataset import (
     YOLODataset,
     YOLOMultiModalDataset,
 )
+from .afss import AFSSManager
 
 __all__ = (
     "BaseDataset",
@@ -23,4 +24,5 @@ __all__ = (
     "build_grounding",
     "build_dataloader",
     "load_inference_source",
+    "AFSSManager"
 )

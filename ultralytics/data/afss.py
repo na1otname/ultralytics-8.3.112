@@ -5,6 +5,7 @@ from ultralytics.utils.ops import xy
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from torch.utils.data import DataLoader
 
+
 def calculate_iou_tensor(box1, box2):
     """计算单框对多框的IoU (xyxy格式)"""
     lt = torch.max(box1[:2], box2[:, :2])
@@ -107,11 +108,33 @@ class AFSSManager:
     # 利用验证集的无增强DataLoader对全体训练集做一次快速推断, 更新state_dict中的P, R记录, 跨5个epochs更新一次
     # 全体训练集边推理边计算, 效率不高, 但可以实时监控模型在训练集上的学习进度, 所以设置5epochs做一次更新
     @torch.no_grad()
-    def evaluate_and_update(self, 
-                            model,
-                            
-                            ):
-        pass
+    def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5):
+        model.eval()
+        
+        for batch in dataloader:
+            imgs = batch['img'].to(model.device)
+            gt_boxes = batch['bboxes']  # ground truth
+            gt_cls = batch['cls']
+            batch_idx = batch['batch_idx']
+            
+            # 模型推理
+            outputs = model(imgs)
+            
+            # 对每个图像计算P和R
+            for img_id in unique(batch_idx):
+                pred_boxes = outputs[img_id].boxes
+                gt_mask = batch_idx == img_id
+                gt_boxes_img = gt_boxes[gt_mask]
+                
+                # 计算Precision和Recall
+                P, R = self._calculate_pr(pred_boxes, gt_boxes_img, iou_thresh, conf_thresh)
+                
+                # 更新状态
+                self.state_dict[img_id]['P'] = P
+                self.state_dict[img_id]['R'] = R
+        
+        model.train()
+
 
 
 
