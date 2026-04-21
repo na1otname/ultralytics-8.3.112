@@ -1,12 +1,11 @@
 import torch
 import random
-from tqdm import tqdm 
-from ultralytics.utils.ops import xy
-from ultralytics.data import build_dataloader, build_yolo_dataset, converter
-from torch.utils.data import DataLoader
+from torch.utils.data import Sampler
+from collections import defaultdict
+from ultralytics.utils import LOGGER
 
 
-def calculate_iou_tensor(box1, box2):
+def iou_xyxy(box1, box2):
     """计算单框对多框的IoU (xyxy格式)"""
     lt = torch.max(box1[:2], box2[:, :2])
     rb = torch.min(box1[2:], box2[:, 2:])
@@ -15,12 +14,20 @@ def calculate_iou_tensor(box1, box2):
     area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
     area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
     union = area1 + area2 - inter
-    return inter / union
+    return inter / union.clamp(min=1e-6)
 
 # 抗遗忘采样策略(Anti-Forgetting Sampling Strategy, AFSS)
 class AFSSManager:
-    def __init__(self, num_samples):
-        self.num_samples = num_samples
+    """
+        AFSS Manager: track per-image P,R and epoch, provide epoch subset and periodic evaluation update.
+        state_dict: {img_idx: {'P': float, 'R': float, 'ep': int}}
+    """
+    def __init__(self, num_samples, easy_frac=0.02, moderate_frac=0.4, forced_mod_gap=3, forced_easy_gap=10):
+        self.num_samples = int(num_samples)
+        self.easy_frac = easy_frac
+        self.moderate_frac = moderate_frac
+        self.forced_mod_gap = forced_mod_gap
+        self.forced_easy_gap = forced_easy_gap
         # 初始化状态字典：{'P': float, 'R': float, 'ep': int}
         # 初始时, P和R都设为0 (全部视为 Hard, 强制学习)
         self.state_dict = {i: {'P': 0.0, 'R': 0.0, 'ep': -1} for i in range(num_samples)}
@@ -52,7 +59,7 @@ class AFSSManager:
         
         # 3. Moderate 样本短时覆盖 (距离上次超过3轮的强制加入)
         # current_epoch是当前训练轮次, 从0开始, state_dict 中的ep从-1开始所以需要减1
-        forced_mod = [img for img in moderate_pool if current_epoch - 1 - self.state_dict[img]['ep'] >= 3]
+        forced_mod = [img for img in moderate_pool if current_epoch - 1 - self.state_dict[img]['ep'] >= self.forced_mod_gap]
         omega.update(forced_mod)
         
         # moderat额外采样数M1, 总共需要40%的中等难度样本训练, M1 = 40% 总量 - 已强制数量(遗忘掉了的moderate样本)
@@ -63,16 +70,16 @@ class AFSSManager:
             omega.update(random.sample(remain_mod, min(M1, len(remain_mod))))
         
         # 4. Easy 样本持续复习 (距离上次超过10轮的强制加入)
-        forced_easy = [img for img in easy_pool if current_epoch - 1 - self.state_dict[img]['ep'] >= 10]
-        # 强制加入的数量最多只能占 easy 样本的 1%(0.5 × 2%)
-        max_forced_easy = int(0.5 * 0.02 * len(easy_pool))
-        if len(forced_easy) > max_forced_easy:
+        forced_easy = [img for img in easy_pool if current_epoch - 1 - self.state_dict[img]['ep'] >= self.forced_easy_gap]
+        max_forced_easy = int(0.5 * self.easy_frac * len(easy_pool))
+
+        if len(forced_easy) > max_forced_easy and max_forced_easy > 0:
             forced_easy = random.sample(forced_easy, max_forced_easy)
         omega.update(forced_easy)
         
         # easy额外采样数E2, 总共只希望 2% 的easy样本参与训练, E2 = 2% 总量 - 已强制数量(遗忘掉了的easy样本, 最多只有1%)
         remain_easy = list(set(easy_pool) - set(forced_easy))
-        E2 = max(0, int(0.02 * len(easy_pool)) - len(forced_easy))
+        E2 = max(0, int(self.easy_frac * len(easy_pool)) - len(forced_easy))
         if E2 > 0 and remain_easy:
             omega.update(random.sample(remain_easy, min(E2, len(remain_easy))))
         
@@ -80,60 +87,156 @@ class AFSSManager:
         # omega是用于强制完整训练的训练集样本, 需要被更新到current_epoch
         for img_id in omega:
             self.state_dict[img_id]['ep'] = current_epoch
-            
         return list(omega)
     
     def print_sufficiency_distribution(self):
         """统计并打印当前数据集的学习充分度分布 (Easy/Moderate/Hard)"""
-        easy_count, mod_count, hard_count = 0, 0, 0
-        for state in self.state_dict.values():
-            suff = min(state['P'], state['R'])
+        easy, mod, hard = 0, 0, 0
+        for s in self.state_dict.values():
+            suff = min(s['P'], s['R'])
             if suff > 0.85:
-                easy_count += 1
+                easy += 1
             elif 0.55 <= suff <= 0.85:
-                mod_count += 1
+                mod += 1
             else:
-                hard_count += 1
-        
-        total = len(self.state_dict)
+                hard += 1
+        total = self.num_samples
         if total == 0:
-            print("  AFSS State Dict is empty!")
+            LOGGER.info("AFSS state empty")
             return
-        
-        print(f"  -> Easy     (>0.85): {easy_count:5d} / {total} ({easy_count/total*100:.1f}%)")
-        print(f"  -> Moderate (0.55-0.85): {mod_count:5d} / {total} ({mod_count/total*100:.1f}%)")
-        print(f"  -> Hard     (<0.55): {hard_count:5d} / {total} ({hard_count/total*100:.1f}%)")
-        print("-" * 60)
+        LOGGER.info(f"AFSS sufficiency: Easy {easy}/{total}, Moderate {mod}/{total}, Hard {hard}/{total}")
+
 
     # 利用验证集的无增强DataLoader对全体训练集做一次快速推断, 更新state_dict中的P, R记录, 跨5个epochs更新一次
     # 全体训练集边推理边计算, 效率不高, 但可以实时监控模型在训练集上的学习进度, 所以设置5epochs做一次更新
     @torch.no_grad()
-    def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5):
+    def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5, device=None):
+        """
+        Run inference over dataloader (no augmentation) and update self.state_dict P,R per image index.
+        Assumptions:
+          - dataloader yields batch dictionaries as in YOLODataset.collate_fn
+          - batch['batch_idx'] contains per-instance image index (as in YOLO collate)
+          - model(...) returns ultralytics Results-like object for each image in batch
+        NOTE: You may need to adapt parsing if your model returns different structure.
+        """        
         model.eval()
+        dev = device if device is not None else getattr(model, "device", None)
         
         for batch in dataloader:
-            imgs = batch['img'].to(model.device)
+            imgs = batch['img'].to(dev)
             gt_boxes = batch['bboxes']  # ground truth
-            gt_cls = batch['cls']
-            batch_idx = batch['batch_idx']
-            
-            # 模型推理
-            outputs = model(imgs)
-            
-            # 对每个图像计算P和R
-            for img_id in unique(batch_idx):
-                pred_boxes = outputs[img_id].boxes
-                gt_mask = batch_idx == img_id
-                gt_boxes_img = gt_boxes[gt_mask]
-                
-                # 计算Precision和Recall
-                P, R = self._calculate_pr(pred_boxes, gt_boxes_img, iou_thresh, conf_thresh)
-                
-                # 更新状态
-                self.state_dict[img_id]['P'] = P
-                self.state_dict[img_id]['R'] = R
-        
+            batch_idx = batch['batch_idx'] # tensor of sample-image-indices concatenated for batch
+            # Model forward: may return list of Results (per image) or a batched result
+            preds = model(imgs)
+            # Normalize preds to list-of-results: try to handle common cases
+            # If preds is Results or list-like with .boxes, adapt accordingly
+            # We assume preds is iterable and preds[i] corresponds to i-th image in batch (or use model(..., stream=True))
+            # Extract per-sample predictions:
+            per_image_preds = []
+            # If model returns a single Results for whole batch with attribute .boxes for each image, try to split:
+            if isinstance(preds, (list, tuple)):
+                per_image_preds = preds
+            else:
+                # Try to call model._split if exists else treat as single
+                try:
+                    per_image_preds = list(preds)
+                except Exception:
+                    per_image_preds = [preds]
+
+            # Now for each image in the batch compute P,R
+            # Get unique image ids in this mini-batch
+            unique_ids = torch.unique(batch_idx)
+            for img_id in unique_ids.tolist():
+                # indices for this image in concatenated targets
+                mask = batch_idx == img_id
+                gt_boxes = batch['bboxes'][mask].cpu()  # (M,4) in xywh norm format
+                # Convert gt xywh -> xyxy in pixel normalized space (dataset stores normalized)
+                if gt_boxes.shape[0] == 0:
+                    # no GT boxes: treat as easy with P=1,R=1? Here set P=1,R=1 to not mark as hard
+                    self.state_dict[img_id]['P'] = 1.0
+                    self.state_dict[img_id]['R'] = 1.0
+                    continue
+                # Determine which prediction corresponds to this image in per_image_preds:
+                # trying to index by order: assume per_image_preds order matches dataloader batch image order
+                # fallback: compute mapping by batch ordering
+                # Here we attempt to find prediction by sequential index:
+                try:
+                    # compute local index (first occurrence position)
+                    local_pos = (batch_idx == img_id).nonzero(as_tuple=False)[0].item()
+                    # determine which per_image_preds index: approximate by floor(local_pos / imgs_per_image)
+                    pred = per_image_preds[0] if len(per_image_preds)==1 else per_image_preds[local_pos] 
+                except Exception:
+                    pred = per_image_preds[0]
+                # Extract pred boxes tensor: attempt common attributes
+                try:
+                    boxes_tensor = pred.boxes.xyxy.cpu()  # Nx4
+                    scores = pred.boxes.conf.cpu()
+                    classes = pred.boxes.cls.cpu()
+                    # filter by conf_thresh
+                    keep = scores >= conf_thresh
+                    boxes_tensor = boxes_tensor[keep]
+                    classes = classes[keep]
+                except Exception:
+                    # fallback: try tensor output (N,6) x1,y1,x2,y2,conf,cls
+                    try:
+                        out = pred.cpu()
+                        boxes_tensor = out[:, :4]
+                        scores = out[:, 4]
+                        keep = scores >= conf_thresh
+                        boxes_tensor = boxes_tensor[keep]
+                    except Exception:
+                        boxes_tensor = torch.empty((0,4))
+                # convert gt xywh -> xyxy (normalized)
+                gt_xywh = gt_boxes
+                gt_xyxy = torch.zeros_like(gt_xywh)
+                # gt shape (N,4): x_center,y_center,w,h normalized
+                gt_xyxy[:,0] = gt_xywh[:,0] - gt_xywh[:,2]/2
+                gt_xyxy[:,1] = gt_xywh[:,1] - gt_xywh[:,3]/2
+                gt_xyxy[:,2] = gt_xywh[:,0] + gt_xywh[:,2]/2
+                gt_xyxy[:,3] = gt_xywh[:,1] + gt_xywh[:,3]/2
+                # compute greedy matching
+                matched_gt = set()
+                tp = 0
+                for pb in boxes_tensor:
+                    if gt_xyxy.shape[0] == 0:
+                        break
+                    ious = iou_xyxy(pb, gt_xyxy)
+                    best_i = torch.argmax(ious).item()
+                    if ious[best_i] >= iou_thresh and best_i not in matched_gt:
+                        tp += 1
+                        matched_gt.add(best_i)
+                fp = boxes_tensor.shape[0] - tp
+                fn = gt_xyxy.shape[0] - len(matched_gt)
+                P = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                R = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                self.state_dict[img_id]['P'] = float(P)
+                self.state_dict[img_id]['R'] = float(R)
         model.train()
+
+class AFSSIndexSampler(Sampler):
+    """
+    Sampler that yields indices from active_indices. Use set_active_indices() to update per-epoch.
+    This sampler is compatible with PyTorch BatchSampler used by DataLoader.
+    """
+    def __init__(self, num_samples, initial_indices=None, shuffle=True):
+        self.num_samples = int(num_samples)
+        if initial_indices is None:
+            self.active_indices = list(range(self.num_samples))
+        else:
+            self.active_indices = list(initial_indices)
+        self.shuffle = shuffle
+    
+    def set_active_indices(self, indices):
+        self.active_indices = list(indices)
+
+    def __iter__(self):
+        idxs = self.active_indices.copy()
+        if self.shuffle:
+            random.shuffle(idxs)
+        return iter(idxs)
+
+    def __len__(self):
+        return len(self.active_indices)
 
 
 

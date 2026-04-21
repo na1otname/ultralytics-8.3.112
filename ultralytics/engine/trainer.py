@@ -21,6 +21,7 @@ import torch
 from torch import distributed as dist
 from torch import nn, optim
 
+from ultralytics.data.afss import AFSSManager, AFSSIndexSampler
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
@@ -300,6 +301,37 @@ class BaseTrainer:
             if self.args.plots:
                 self.plot_training_labels()
 
+        # ===== AFSS initialization (insert start) =====
+        if getattr(self.args, 'afss', False) and RANK in {-1, 0}:
+            try:
+                num_samples = getattr(self.train_loader.dataset, 'ni', len(self.train_loader.dataset))
+                self.afss_manager = AFSSManager(
+                    num_samples=num_samples,
+                    easy_frac=getattr(self.args, 'afss_easy_frac', 0.02),
+                    moderate_frac=getattr(self.args, "afss_moderate_frac", 0.4),
+                )
+                # Create AFSS sampler and inject into DataLoader's underlying sampler used by BatchSampler
+                afss_sampler = AFSSIndexSampler(num_samples, initial_indices=list(range(num_samples)))
+                # Replace the sampler inside the batch_sampler (works with InfiniteDataLoader/BatchSampler)
+                try:
+                    # InfiniteDataLoader.batch_sampler is _RepeatSampler -> .sampler is the original BatchSampler
+                    # BatchSampler.sampler is the original sampler object; replace it.
+                    self.train_loader.batch_sampler.sampler = afss_sampler
+                except Exception:
+                    # Fallback: try set .sampler attribute directly
+                    try:
+                        self.train_loader.sampler = afss_sampler
+                    except Exception:
+                        LOGGER.warning("AFSS: Failed to inject AFSS sampler into DataLoader; AFSS disabled.")
+                        self.afss_manager = None
+                        afss_sampler = None
+                # Build a non-augmented eval loader over the same dataset for evaluation updates
+                self.afss_eval_loader = self.get_dataloader(self.trainset, batch_size=min(batch_size*2, 64), rank=-1, mode="val")
+            except Exception as e:
+                LOGGER.warning(f"AFSS initialization failed: {e}")
+                self.afss_manager = None
+        # ===== AFSS initialization (insert end) =====
+
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
@@ -346,6 +378,36 @@ class BaseTrainer:
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
+            
+            # ===== AFSS per-epoch update (insert start) =====
+            if getattr(self, "afss_manager", None):
+                try:
+                    omega = self.afss_manager.get_epoch_subset(self.epoch)
+                    # update sampler active indices\
+                    try:
+                        # underlying sampler could be at train_loader.batch_sampler.sampler.sampler
+                        bs_sampler = getattr(self.train_loader.batch_sampler.sampler, "sampler", None)
+                        if hasattr(bs_sampler, "set_active_indices"):
+                            bs_sampler.set_active_indices(omega)
+                        elif hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, "set_active_indices"):
+                            self.train_loader.sampler.set_active_indices(omega)
+                        else:
+                            LOGGER.warning("AFSS: sampler not found or does not support set_active_indices.")
+                    except Exception as e:
+                        LOGGER.warning(f"AFSS: failed to set active indices: {e}")
+                    # periodic evaluation update
+                    if (self.epoch % getattr(self.args, "afss_interval", 5)) == 0 and self.epoch != self.start_epoch:
+                        self.afss_manager.evaluate_and_update(
+                            self.model, self.afss_eval_loader,
+                            conf_thresh=getattr(self.args, "afss_conf", 0.2),
+                            iou_thresh=getattr(self.args, "afss_iou", 0.5),
+                            device=self.device,
+                        )
+                        self.afss_manager.print_sufficiency_distribution()
+                except Exception as e:
+                    LOGGER.warning(f"AFSS per-epoch error: {e}")
+            # ===== AFSS per-epoch update (insert end) =====
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()

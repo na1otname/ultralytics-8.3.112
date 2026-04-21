@@ -43,7 +43,17 @@ mask_ratio: 4 # (int) mask downsample ratio (segment train only)
 # Classification
 dropout: 0.0 # (float) use dropout regularization (classify train only)
 
-# Val/Test settings ----------------------------------------------------------------------------------------------------
+# AFSS (Anti-Forgetting Sampling Strategy) settings
+#------------------------------------------------------------------------------------------------------------------------------------
+afss: False              # Enable AFSS sampling
+afss_interval: 5         # Run AFSS evaluate_and_update every N epochs
+afss_conf: 0.2           # Confidence threshold used during AFSS evaluation
+afss_iou: 0.5            # IOU threshold used during AFSS evaluation
+afss_easy_frac: 0.02     # Target fraction of easy samples per epoch
+afss_moderate_frac: 0.4  # Target fraction of moderate samples per epoch
+#----------------------------------------------------------------------------------------
+
+# Val/Test settings ------------------------------------------------------------------------------------------------------------------------------------------------
 val: True # (bool) validate/test during training
 split: val # (str) dataset split to use for validation, i.e. 'val', 'test' or 'train'
 save_json: False # (bool) save results to JSON file
