@@ -386,7 +386,7 @@ class BaseTrainer:
                     # update sampler active indices\
                     try:
                         # underlying sampler could be at train_loader.batch_sampler.sampler.sampler
-                        bs_sampler = getattr(self.train_loader.batch_sampler.sampler, "sampler", None)
+                        bs_sampler = getattr(self.train_loader.batch_sampler, "sampler", None)
                         if hasattr(bs_sampler, "set_active_indices"):
                             bs_sampler.set_active_indices(omega)
                         elif hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, "set_active_indices"):
