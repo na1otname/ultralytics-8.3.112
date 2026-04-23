@@ -5,6 +5,7 @@ import numpy as np
 from torch.utils.data import Sampler
 from typing import List, Optional
 from ultralytics.utils import LOGGER, TQDM, ops
+from ultralytics.utils.metrics import box_iou
 from torch import distributed as dist
 
 
@@ -46,7 +47,111 @@ class AFSSManager:
         self.forced_easy_gap = int(forced_easy_gap)
         # initialize state: P,R in [0,1], ep last epoch updated
         self.state_dict = {i: {"P": 0.0, "R": 0.0, "ep": -1} for i in range(self.num_samples)}
+        # IoU thresholds used for matching (mAP-style 10 thresholds by default)
+        self.iouv = torch.linspace(0.5, 0.95, 10)
+        self.device = None
 
+    
+    def _prepare_batch(self, si, batch):
+        """
+        Prepare a batch of images and annotations for validation.
+
+        Args:
+            si (int): Batch index.
+            batch (dict): Batch data containing images and annotations.
+
+        Returns:
+            (dict): Prepared batch with processed annotations.
+        """
+        idx = batch["batch_idx"] == si
+        cls = batch["cls"][idx].squeeze(-1)
+        bbox = batch["bboxes"][idx]
+        ori_shape = batch["ori_shape"][si]
+        imgsz = batch["img"].shape[2:]
+        ratio_pad = batch["ratio_pad"][si]
+        if len(cls):
+            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz)[[1, 0, 1, 0]]  # target boxes
+            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
+        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
+    
+    def _prepare_pred(self, pred, pbatch):
+        """
+        Prepare predictions for evaluation against ground truth.
+
+        Args:
+            pred (torch.Tensor): Model predictions.
+            pbatch (dict): Prepared batch information.
+
+        Returns:
+            (torch.Tensor): Prepared predictions in native space.
+        """
+        predn = pred.clone()
+        ops.scale_boxes(
+            pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
+        )  # native-space pred
+        return predn
+    
+    def match_predictions(
+        self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
+    ) -> torch.Tensor:
+        """
+        Match predictions to ground truth objects using IoU.
+
+        Args:
+            pred_classes (torch.Tensor): Predicted class indices of shape (N,).
+            true_classes (torch.Tensor): Target class indices of shape (M,).
+            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground truth.
+            use_scipy (bool): Whether to use scipy for matching (more precise).
+
+        Returns:
+            (torch.Tensor): Correct tensor of shape (N, 10) for 10 IoU thresholds.
+        """
+        # Dx10 matrix, where D - detections, 10 - IoU thresholds
+        correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
+        # LxD matrix where L - labels (rows), D - detections (columns)
+        correct_class = true_classes[:, None] == pred_classes
+        iou = iou * correct_class  # zero out the wrong classes
+        iou = iou.cpu().numpy()
+        for i, threshold in enumerate(self.iouv.cpu().tolist()):
+            if use_scipy:
+                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
+                import scipy  # scope import to avoid importing for all commands
+
+                cost_matrix = iou * (iou >= threshold)
+                if cost_matrix.any():
+                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix)
+                    valid = cost_matrix[labels_idx, detections_idx] > 0
+                    if valid.any():
+                        correct[detections_idx[valid], i] = True
+            else:
+                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
+                matches = np.array(matches).T
+                if matches.shape[0]:
+                    if matches.shape[0] > 1:
+                        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
+                        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                        # matches = matches[matches[:, 2].argsort()[::-1]]
+                        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+                    correct[matches[:, 1].astype(int), i] = True
+        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+
+    def _process_batch(self, detections, gt_bboxes, gt_cls):
+        """
+        Return correct prediction matrix.
+
+        Args:
+            detections (torch.Tensor): Tensor of shape (N, 6) representing detections where each detection is
+                (x1, y1, x2, y2, conf, class).
+            gt_bboxes (torch.Tensor): Tensor of shape (M, 4) representing ground-truth bounding box coordinates. Each
+                bounding box is of the format: (x1, y1, x2, y2).
+            gt_cls (torch.Tensor): Tensor of shape (M,) representing target class indices.
+
+        Returns:
+            (torch.Tensor): Correct prediction matrix of shape (N, 10) for 10 IoU levels.
+        """
+        iou = box_iou(gt_bboxes, detections[:, :4])
+        return self.match_predictions(detections[:, 5], gt_cls, iou)
+            
     def get_epoch_subset(self, current_epoch: int) -> List[int]:
         """Return list of indices (omega) for training this epoch and update ep for chosen indices."""
         omega = set()
@@ -120,105 +225,82 @@ class AFSSManager:
             - GT format is expected to be normalized xywh in `batch['bboxes']`
             - model(...) should return ultralytics-like Results per image (or a list/iterable)
         """
-        pbar = TQDM(enumerate(dataloader), total=len(dataloader), desc="AFSS Evaluating")
+        pbar = TQDM(dataloader, total=len(dataloader), desc="AFSS Evaluating")
         model.eval()
-        for si, batch in enumerate(pbar):
-            imgs = batch['img'].to(device=next(model.parameters()).device, 
-                        dtype=next(model.parameters()).dtype) / 255.0
-            bs, _, h, w = imgs.shape
-            batch_idx = batch["batch_idx"]
-            
 
-            # model output: try to normalize to per-image iterable
+        # set device and ensure iou vector exists
+        self.device = next(model.parameters()).device
+        if not hasattr(self, "iouv") or self.iouv is None:
+            self.iouv = torch.linspace(0.5, 0.95, 10)
+
+        # dataset reference for mapping image file -> global index
+        dataset = getattr(dataloader, "dataset", None)
+
+        seen = 0
+        for si, batch in enumerate(pbar):
+            imgs = batch["img"].to(device=self.device, dtype=next(model.parameters()).dtype) / 255.0
+
+            # model output: normalize to per-image iterable
             preds = model(imgs)
             per_image_preds = ops.non_max_suppression(preds, conf_thresh, iou_thresh)
 
-            unique_ids = torch.unique(batch_idx)
-            for img_id in unique_ids.tolist():
-                mask = batch_idx == img_id
-                gt_boxes = batch.get("bboxes", None)
-                if gt_boxes is None or gt_boxes[mask].numel() == 0:
-                    # no GT: mark as easy to avoid forcing
-                    self.state_dict[img_id]["P"] = 1.0
-                    self.state_dict[img_id]["R"] = 1.0
+            for i, pred in enumerate(per_image_preds):
+                seen += 1
+                npr = len(pred)
+
+                pbatch = self._prepare_batch(i, batch)
+                cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
+                bbox = bbox.to(self.device)
+                cls = cls.to(self.device)
+                predn = self._prepare_pred(pred, pbatch)
+
+                # skip images without ground truth (no meaningful recall)
+                ngt = int(len(cls))
+                if ngt == 0:
                     continue
 
-                gt_boxes_img = gt_boxes[mask].cpu()
-                # try pick corresponding prediction: assume per_image_preds order matches batch images
-                # fallback to first prediction if mismatch
-                try:
-                    # approximate index by the first occurrence position in batch
-                    first_pos = (batch_idx == img_id).nonzero(as_tuple=False)[0].item()
-                    pred = per_image_preds[0] if len(per_image_preds) == 1 else per_image_preds[first_pos]
-                except Exception:
-                    pred = per_image_preds[0]
-
-                # extract predicted boxes
-                img_mask = (batch_idx == img_id).cpu()
-                try:
-                    all_boxes = pred.boxes.xyxy.cpu()
-                    all_scores = pred.boxes.conf.cpu()
-                    boxes_tensor = all_boxes[img_mask]
-                    scores = all_scores[img_mask]
-                except Exception:
-                    try:
-                        out = pred.cpu()
-                        if out.ndim == 2:
-                            # [total_pred, 6]
-                            all_boxes = out[:, :4]
-                            all_scores = out[:, 4]
-                            boxes_tensor = all_boxes[img_mask]
-                            scores = all_scores[img_mask]
-                        elif out.ndim == 3 and out.shape[0] == imgs.shape[0]:
-                            # [batch, num_pred, 6]
-                            single = out[first_pos]
-                            boxes_tensor = single[:, :4]
-                            scores = single[:, 4]
-                        else:
-                            # try [batch, 4, num_pred]
-                            if out.shape[1] == 4:
-                                single = out[first_pos]  # [4, num_pred]
-                                boxes_tensor = single.T  # [num_pred, 4]
-                                scores = torch.ones(boxes_tensor.shape[0])  # dummy scores
-                            else:
-                                boxes_tensor = torch.zeros((0, 4))
-                                scores = torch.zeros((0,))
-                    except Exception:
-                        boxes_tensor = torch.zeros((0, 4))
-                        scores = torch.zeros((0,))
-
-                keep = scores >= conf_thresh if scores.numel() else torch.tensor([], dtype=torch.bool)
-                if keep.numel():
-                    boxes_tensor = boxes_tensor[keep]
+                # compute true positives matrix for all IoU thresholds
+                if npr == 0:
+                    tp_count = 0
                 else:
-                    boxes_tensor = boxes_tensor
+                    correct = self._process_batch(predn, bbox, cls)  # (npr, n_iou)
+                    # pick the IoU threshold nearest to iou_thresh
+                    thr_idx = int((self.iouv.cpu() - float(iou_thresh)).abs().argmin().item())
+                    tp_count = int(correct[:, thr_idx].sum().item())
 
-                # convert gt xywh -> xyxy
-                gt_xywh = gt_boxes_img
-                gt_xyxy = torch.zeros_like(gt_xywh)
-                gt_xyxy[:, 0] = (gt_xywh[:, 0] - gt_xywh[:, 2] / 2) * w
-                gt_xyxy[:, 1] = (gt_xywh[:, 1] - gt_xywh[:, 3] / 2) * h
-                gt_xyxy[:, 2] = (gt_xywh[:, 0] + gt_xywh[:, 2] / 2) * w
-                gt_xyxy[:, 3] = (gt_xywh[:, 1] + gt_xywh[:, 3] / 2) * h
+                fp = max(0, npr - tp_count)
+                fn = max(0, ngt - tp_count)
 
-                matched_gt = set()
-                tp = 0
-                for pb in boxes_tensor:
-                    if gt_xyxy.shape[0] == 0:
-                        break
-                    ious = iou_xyxy(pb, gt_xyxy)
-                    if ious.numel() == 0:
-                        continue
-                    best_i = torch.argmax(ious).item()
-                    if ious[best_i] >= iou_thresh and best_i not in matched_gt:
-                        tp += 1
-                        matched_gt.add(best_i)
-                fp = max(0, boxes_tensor.shape[0] - tp)
-                fn = max(0, gt_xyxy.shape[0] - len(matched_gt))
-                P = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                R = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                self.state_dict[img_id]["P"] = float(P)
-                self.state_dict[img_id]["R"] = float(R)
+                P = tp_count / (tp_count + fp) if (tp_count + fp) > 0 else 0.0
+                R = tp_count / (tp_count + fn) if (tp_count + fn) > 0 else 0.0
+
+                # map batch image -> global image id using image file list when available
+                img_id = None
+                if "im_file" in batch:
+                    try:
+                        im_file = batch["im_file"][i]
+                        # normalize to str for matching
+                        im_file_s = str(im_file)
+                        if dataset is not None and hasattr(dataset, "im_files"):
+                            try:
+                                img_id = int(dataset.im_files.index(im_file_s))
+                            except ValueError:
+                                # sometimes im_file may already be a Path or differ in formatting
+                                # try matching by stem (filename without suffix)
+                                from pathlib import Path
+
+                                stem = Path(im_file_s).stem
+                                for idx, f in enumerate(dataset.im_files):
+                                    if Path(f).stem == stem:
+                                        img_id = idx
+                                        break
+                    except Exception:
+                        img_id = None
+
+                # update AFSS state for this image if mapped
+                if img_id is not None and img_id in self.state_dict:
+                    self.state_dict[img_id]["P"] = float(P)
+                    self.state_dict[img_id]["R"] = float(R)
 
         model.train()
 
