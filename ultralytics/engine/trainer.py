@@ -21,7 +21,7 @@ import torch
 from torch import distributed as dist
 from torch import nn, optim
 
-from ultralytics.data.afss import AFSSManager, AFSSIndexSampler
+from ultralytics.data.afss_matcher import AFSSManager, AFSSIndexSampler, AFSSDistributedSampler
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
@@ -302,31 +302,58 @@ class BaseTrainer:
                 self.plot_training_labels()
 
         # ===== AFSS initialization (insert start) =====
-        if getattr(self.args, 'afss', False) and RANK in {-1, 0}:
+        if getattr(self.args, 'afss', False):
             try:
                 num_samples = getattr(self.train_loader.dataset, 'ni', len(self.train_loader.dataset))
-                self.afss_manager = AFSSManager(
-                    num_samples=num_samples,
-                    easy_frac=getattr(self.args, 'afss_easy_frac', 0.02),
-                    moderate_frac=getattr(self.args, "afss_moderate_frac", 0.4),
-                )
-                # Create AFSS sampler and inject into DataLoader's underlying sampler used by BatchSampler
-                afss_sampler = AFSSIndexSampler(num_samples, initial_indices=list(range(num_samples)))
-                # Replace the sampler inside the batch_sampler (works with InfiniteDataLoader/BatchSampler)
+                # Create a sampler appropriate for this process (DDP-aware or single-process)
+                if world_size > 1:
+                    afss_sampler = AFSSDistributedSampler(self.train_loader.dataset, active_indices=list(range(num_samples)), shuffle=True)
+                else:
+                    afss_sampler = AFSSIndexSampler(num_samples, initial_indices=list(range(num_samples)))
+
+                # Attempt to inject sampler into existing DataLoader's underlying sampler (preferred)
+                injected = False
                 try:
-                    # InfiniteDataLoader.batch_sampler is _RepeatSampler -> .sampler is the original BatchSampler
-                    # BatchSampler.sampler is the original sampler object; replace it.
-                    self.train_loader.batch_sampler.sampler = afss_sampler
-                except Exception:
-                    # Fallback: try set .sampler attribute directly
+                    bs = getattr(self.train_loader, 'batch_sampler', None)
+                    if bs is not None:
+                        # _RepeatSampler -> .sampler is underlying BatchSampler
+                        underlying_bs = getattr(bs, 'sampler', bs)
+                        if hasattr(underlying_bs, 'sampler'):
+                            underlying_bs.sampler = afss_sampler
+                            injected = True
+                    if not injected:
+                        # fallback: set DataLoader.sampler
+                        setattr(self.train_loader, 'sampler', afss_sampler)
+                        injected = True
+                except Exception as e:
+                    LOGGER.warning(f"AFSS: injection to existing DataLoader failed: {e}")
+
+                if not injected:
+                    # rebuild dataloader with our sampler
                     try:
-                        self.train_loader.sampler = afss_sampler
-                    except Exception:
-                        LOGGER.warning("AFSS: Failed to inject AFSS sampler into DataLoader; AFSS disabled.")
-                        self.afss_manager = None
-                        afss_sampler = None
-                # Build a non-augmented eval loader over the same dataset for evaluation updates
-                self.afss_eval_loader = self.get_dataloader(self.trainset, batch_size=min(batch_size*2, 64), rank=-1, mode="val")
+                        from ultralytics.data.build import build_dataloader
+
+                        self.train_loader = build_dataloader(
+                            self.train_loader.dataset,
+                            self.batch_size,
+                            self.args.workers,
+                            shuffle=True,
+                            rank=LOCAL_RANK,
+                            sampler=afss_sampler,
+                        )
+                    except Exception as e:
+                        LOGGER.warning(f"AFSS: rebuild train_loader failed: {e}")
+
+                # Only rank 0 (or single-process) holds the AFSSManager and eval loader
+                if RANK in {-1, 0}:
+                    self.afss_manager = AFSSManager(
+                        num_samples=num_samples,
+                        easy_frac=getattr(self.args, 'afss_easy_frac', 0.02),
+                        moderate_frac=getattr(self.args, 'afss_moderate_frac', 0.4),
+                    )
+                    self.afss_eval_loader = self.get_dataloader(self.trainset, batch_size=min(batch_size * 2, 64), rank=-1, mode='val')
+                else:
+                    self.afss_manager = None
             except Exception as e:
                 LOGGER.warning(f"AFSS initialization failed: {e}")
                 self.afss_manager = None
@@ -380,27 +407,46 @@ class BaseTrainer:
             self.run_callbacks("on_train_epoch_start")
             
             # ===== AFSS per-epoch update (insert start) =====
-            if getattr(self, "afss_manager", None):
+            if getattr(self, "afss_manager", None) or getattr(self, 'afss_eval_loader', None):
                 try:
-                    omega = self.afss_manager.get_epoch_subset(self.epoch)
-                    # update sampler active indices\
-                    try:
-                        # underlying sampler could be at train_loader.batch_sampler.sampler.sampler
-                        bs_sampler = getattr(self.train_loader.batch_sampler, "sampler", None)
-                        if hasattr(bs_sampler, "set_active_indices"):
-                            bs_sampler.set_active_indices(omega)
-                        elif hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, "set_active_indices"):
-                            self.train_loader.sampler.set_active_indices(omega)
+                    # Only rank 0 computes omega; broadcast to other ranks in DDP
+                    omega = None
+                    if RANK in {-1, 0} and getattr(self, 'afss_manager', None):
+                        omega = self.afss_manager.get_epoch_subset(self.epoch)
+
+                    if world_size > 1:
+                        obj = [omega] if RANK == 0 else [None]
+                        dist.broadcast_object_list(obj, src=0)
+                        omega = obj[0]
+
+                    if omega is not None:
+                        # find base sampler (BatchSampler.sampler -> base sampler)
+                        bs = getattr(self.train_loader, 'batch_sampler', None)
+                        base_sampler = None
+                        if bs is not None:
+                            underlying_bs = getattr(bs, 'sampler', None)
+                            if underlying_bs is not None and hasattr(underlying_bs, 'sampler'):
+                                base_sampler = underlying_bs.sampler
+                            elif hasattr(bs, 'sampler'):
+                                base_sampler = bs.sampler
+                        if base_sampler is None:
+                            base_sampler = getattr(self.train_loader, 'sampler', None)
+
+                        if hasattr(base_sampler, 'set_active_indices'):
+                            try:
+                                base_sampler.set_active_indices(omega)
+                            except Exception as e:
+                                LOGGER.warning(f"AFSS: set_active_indices failed: {e}")
                         else:
-                            LOGGER.warning("AFSS: sampler not found or does not support set_active_indices.")
-                    except Exception as e:
-                        LOGGER.warning(f"AFSS: failed to set active indices: {e}")
-                    # periodic evaluation update
-                    if (self.epoch % getattr(self.args, "afss_interval", 5)) == 0 and self.epoch != self.start_epoch:
+                            LOGGER.warning("AFSS: sampler does not support set_active_indices.")
+
+                    # periodic evaluation update only on rank 0
+                    if RANK in {-1, 0} and getattr(self, 'afss_manager', None) and (self.epoch % getattr(self.args, 'afss_interval', 5) == 0) and (self.epoch != self.start_epoch):
                         self.afss_manager.evaluate_and_update(
-                            self.model, self.afss_eval_loader,
-                            conf_thresh=getattr(self.args, "afss_conf", 0.2),
-                            iou_thresh=getattr(self.args, "afss_iou", 0.5),
+                            self.model,
+                            self.afss_eval_loader,
+                            conf_thresh=getattr(self.args, 'afss_conf', 0.2),
+                            iou_thresh=getattr(self.args, 'afss_iou', 0.5),
                             device=self.device,
                         )
                         self.afss_manager.print_sufficiency_distribution()
