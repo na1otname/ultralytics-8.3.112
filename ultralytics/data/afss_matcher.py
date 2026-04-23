@@ -254,9 +254,18 @@ class AFSSManager:
                 cls = cls.to(self.device)
                 predn = self._prepare_pred(pred, pbatch)
 
-                # skip images without ground truth (no meaningful recall)
+                # 处理负样本
                 ngt = int(len(cls))
                 if ngt == 0:
+                    if npr == 0:
+                        self.state_dict[img_id]["P"] = 1.0
+                        self.state_dict[img_id]["R"] = 1.0
+
+                    else:
+                        # 如果模型在背景图上产生了误报 (npr>0)，精确率为 0
+                        self.state_dict[img_id]["P"] = 0.0
+                        self.state_dict[img_id]["R"] = 1.0 # 负样本不存在漏检，R 可设为 1
+
                     continue
 
                 # compute true positives matrix for all IoU thresholds
