@@ -10,7 +10,7 @@ from .dataset import (
     YOLODataset,
     YOLOMultiModalDataset,
 )
-from .afss import AFSSManager
+from .afss_matcher import AFSSManager
 
 __all__ = (
     "BaseDataset",

@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 from torch.utils.data import Sampler
 from typing import List, Optional
-from ultralytics.utils import LOGGER
+from ultralytics.utils import LOGGER, TQDM, ops
 from torch import distributed as dist
 
 
@@ -112,7 +112,7 @@ class AFSSManager:
 
 
     @torch.no_grad()
-    def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5, device=None):
+    def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5):
         """Run inference over dataloader and update P,R for each image index.
 
         Notes:
@@ -120,18 +120,18 @@ class AFSSManager:
             - GT format is expected to be normalized xywh in `batch['bboxes']`
             - model(...) should return ultralytics-like Results per image (or a list/iterable)
         """
+        pbar = TQDM(enumerate(dataloader), total=len(dataloader), desc="AFSS Evaluating")
         model.eval()
-        dev = device if device is not None else getattr(model, "device", None)
-        if dev is None:
-            dev = next(model.parameters()).device if any(p.requires_grad for p in model.parameters()) else torch.device("cpu")
-        
-        for batch in dataloader:
+        for si, batch in enumerate(pbar):
             imgs = batch['img'].to(device=next(model.parameters()).device, 
                         dtype=next(model.parameters()).dtype) / 255.0
+            bs, _, h, w = imgs.shape
             batch_idx = batch["batch_idx"]
+            
+
             # model output: try to normalize to per-image iterable
             preds = model(imgs)
-            per_image_preds = preds if isinstance(preds, (list, tuple)) else [preds]
+            per_image_preds = ops.non_max_suppression(preds, conf_thresh, iou_thresh)
 
             unique_ids = torch.unique(batch_idx)
             for img_id in unique_ids.tolist():
@@ -196,10 +196,10 @@ class AFSSManager:
                 # convert gt xywh -> xyxy
                 gt_xywh = gt_boxes_img
                 gt_xyxy = torch.zeros_like(gt_xywh)
-                gt_xyxy[:, 0] = gt_xywh[:, 0] - gt_xywh[:, 2] / 2
-                gt_xyxy[:, 1] = gt_xywh[:, 1] - gt_xywh[:, 3] / 2
-                gt_xyxy[:, 2] = gt_xywh[:, 0] + gt_xywh[:, 2] / 2
-                gt_xyxy[:, 3] = gt_xywh[:, 1] + gt_xywh[:, 3] / 2
+                gt_xyxy[:, 0] = (gt_xywh[:, 0] - gt_xywh[:, 2] / 2) * w
+                gt_xyxy[:, 1] = (gt_xywh[:, 1] - gt_xywh[:, 3] / 2) * h
+                gt_xyxy[:, 2] = (gt_xywh[:, 0] + gt_xywh[:, 2] / 2) * w
+                gt_xyxy[:, 3] = (gt_xywh[:, 1] + gt_xywh[:, 3] / 2) * h
 
                 matched_gt = set()
                 tp = 0

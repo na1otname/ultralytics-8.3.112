@@ -446,8 +446,7 @@ class BaseTrainer:
                             self.model,
                             self.afss_eval_loader,
                             conf_thresh=getattr(self.args, 'afss_conf', 0.2),
-                            iou_thresh=getattr(self.args, 'afss_iou', 0.5),
-                            device=self.device,
+                            iou_thresh=getattr(self.args, 'afss_iou', 0.5)
                         )
                         self.afss_manager.print_sufficiency_distribution()
                 except Exception as e:

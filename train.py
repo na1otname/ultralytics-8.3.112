@@ -5,7 +5,7 @@ from ultralytics  import YOLO
 if __name__ == "__main__":
     model = YOLO('yolo11n.yaml')
     model.train(
-        data=r'F:\Dataset\african-wildlife\african-wildlife.yaml',
+        data=r'F:\Project_py\datasets\african-wildlife\african-wildlife.yaml',
         model='yolo11n.yaml',
         epochs=100,
         batch=8,
