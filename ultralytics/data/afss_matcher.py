@@ -345,61 +345,44 @@ class AFSSDistributedSampler(Sampler):
         self,
         dataset,
         active_indices: Optional[List[int]] = None,
-        num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
+        world_size: int =1,
         shuffle: bool = True,
         seed: int = 0,
-        drop_last: bool = False,
     ):
-        if num_replicas is None:
-            if dist.is_available() and dist.is_initialized():
-                num_replicas = dist.get_world_size()
-            else:
-                num_replicas = 1
-        if rank is None:
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-            else:
-                rank = 0
         self.dataset = dataset
-        self.num_replicas = int(num_replicas)
-        self.rank = int(rank)
         self.shuffle = shuffle
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed or 0)
         self.epoch = 0
-        self.active_indices = list(range(len(dataset))) if active_indices is None else list(active_indices)
+        # global active_indices (list of dataset indices)
+        self.active_indices = list(active_indices) if active_indices is not None else list(range(len(dataset)))
+        self.local_indices = []
+        self._rebuild_local_indices()
 
-    def set_active_indices(self, indices: List[int]):
-        self.active_indices = list(indices)
+    def _rebuild_local_indices(self):
+        inds = list(self.active_indices)
+        if self.shuffle:
+            rnd = random.Random(self.seed + self.epoch)
+            rnd.shuffle(inds)
+        # slice by rank to distribute indices across processes
+        self.local_indices = inds[self.rank::self.world_size]
 
-    def set_epoch(self, epoch: int):
+    def set_active_indices(self, active_indices):
+        # active_indices is global list from AFSSManager (or None)
+        if active_indices is None:
+            return
+        self.active_indices = list(active_indices)
+        self._rebuild_local_indices()
+
+    def set_epoch(self, epoch):
         self.epoch = int(epoch)
+        self._rebuild_local_indices()
 
     def __iter__(self):
-        # copy active indices
-        indices = list(self.active_indices)
-        if self.shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            perm = torch.randperm(len(indices), generator=g).tolist() if len(indices) > 0 else []
-            indices = [indices[i] for i in perm]
-
-        # add extra samples to make it evenly divisible
-        if not self.drop_last:
-            rem = (-len(indices)) % self.num_replicas
-            if rem:
-                # pad with indices from the beginning
-                indices += indices[:rem]
-        else:
-            # drop tail so that evenly divisible
-            indices = indices[: (len(indices) // self.num_replicas) * self.num_replicas]
-
-        # subsample
-        indices = indices[self.rank:: self.num_replicas]
-        return iter(indices)
+        for idx in self.local_indices:
+            yield idx
 
     def __len__(self):
-        if self.drop_last:
-            return len(self.active_indices) // self.num_replicas
-        return (len(self.active_indices) + self.num_replicas - 1) // self.num_replicas
+        return len(self.local_indices)

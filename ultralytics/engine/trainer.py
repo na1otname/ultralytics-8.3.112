@@ -307,7 +307,13 @@ class BaseTrainer:
                 num_samples = getattr(self.train_loader.dataset, 'ni', len(self.train_loader.dataset))
                 # Create a sampler appropriate for this process (DDP-aware or single-process)
                 if world_size > 1:
-                    afss_sampler = AFSSDistributedSampler(self.train_loader.dataset, active_indices=list(range(num_samples)), shuffle=True)
+                    afss_sampler = AFSSDistributedSampler(
+                                                        self.train_loader.dataset,
+                                                        active_indices=list(range(num_samples)),
+                                                        shuffle=True,
+                                                        rank=RANK,
+                                                        world_size=world_size,
+                                                        seed=getattr(self.args, "seed", 0),)
                 else:
                     afss_sampler = AFSSIndexSampler(num_samples, initial_indices=list(range(num_samples)))
 
@@ -435,6 +441,8 @@ class BaseTrainer:
                         if hasattr(base_sampler, 'set_active_indices'):
                             try:
                                 base_sampler.set_active_indices(omega)
+                                if hasattr(base_sampler, 'set_epoch'):
+                                    base_sampler.set_epoch(self.epoch)
                             except Exception as e:
                                 LOGGER.warning(f"AFSS: set_active_indices failed: {e}")
                         else:
