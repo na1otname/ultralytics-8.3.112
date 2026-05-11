@@ -66,12 +66,26 @@ class AFSSManager:
         idx = batch["batch_idx"] == si
         cls = batch["cls"][idx].squeeze(-1)
         bbox = batch["bboxes"][idx]
-        ori_shape = batch["ori_shape"][si]
-        imgsz = batch["img"].shape[2:]
-        ratio_pad = batch["ratio_pad"][si]
+        
+        # 2. 这里的 device 统一引用 bbox.device
+        device = bbox.device
+        dtype = bbox.dtype
+
+        # 3. 处理 imgsz（注意：imgsz 只需创建一次）
+        imgsz = torch.tensor(batch["img"].shape[2:], device=device, dtype=dtype)
+        
+        # 4. 处理其他元数据 (如果 batch["ori_shape"] 等是 list，则用 torch.as_tensor 更快)
+        ori_shape = torch.as_tensor(batch["ori_shape"][si], device=device, dtype=dtype)
+        ratio_pad = torch.as_tensor(batch["ratio_pad"][si], device=device, dtype=dtype)
+
         if len(cls):
-            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz)[[1, 0, 1, 0]]  # target boxes
-            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
+            
+            # 使用 imgsz[[1, 0, 1, 0]] 获取缩放系数
+            bbox = ops.xywh2xyxy(bbox) * imgsz[[1, 0, 1, 0]]  
+            
+            # 将坐标缩放到原始图像尺寸
+            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad) 
+            
         return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
     
     def _prepare_pred(self, pred, pbatch):
@@ -238,8 +252,12 @@ class AFSSManager:
 
         seen = 0
         for si, batch in enumerate(pbar):
-            imgs = batch["img"].to(device=self.device, dtype=next(model.parameters()).dtype) / 255.0
-
+            # 将数据移动到gpu上面
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device=self.device, non_blocking=True)
+            imgs = batch["img"].to(dtype=next(model.parameters()).dtype) / 255.0
+            
             # model output: normalize to per-image iterable
             preds = model(imgs)
             per_image_preds = ops.non_max_suppression(preds, conf_thresh, iou_thresh)
@@ -250,8 +268,8 @@ class AFSSManager:
 
                 pbatch = self._prepare_batch(i, batch)
                 cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
-                bbox = bbox.to(self.device)
-                cls = cls.to(self.device)
+                # bbox = bbox.to(self.device)
+                # cls = cls.to(self.device)
                 predn = self._prepare_pred(pred, pbatch)
 
                 # 处理负样本
