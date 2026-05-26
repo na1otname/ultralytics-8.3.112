@@ -1,12 +1,11 @@
 import random
-import torch
-import warnings
-import numpy as np
-from torch.utils.data import Sampler
+from pathlib import Path
 from typing import List, Optional
+import numpy as np
+import torch
+from torch.utils.data import Sampler
 from ultralytics.utils import LOGGER, TQDM, ops
 from ultralytics.utils.metrics import box_iou
-from torch import distributed as dist
 
 
 def iou_xyxy(box1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -26,155 +25,177 @@ def iou_xyxy(box1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     return inter / union.clamp(min=1e-6)
 
 
-class AFSSManager:
-    """Anti-Forgetting Sampling Strategy manager.
+def _unique_first(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a boolean mask marking the first occurrence of each unique value.
 
-    Tracks per-image P/R and last-epoch seen; produces per-epoch active index subset.
+    Args:
+        tensor: 1-D GPU tensor.
+
+    Returns:
+        mask: boolean tensor, True for first occurrence.
+    """
+    device = tensor.device
+    sorted_vals, sort_idx = torch.sort(tensor)
+    mask = torch.cat([
+        torch.ones(1, dtype=torch.bool, device=device),
+        sorted_vals[1:] != sorted_vals[:-1]
+    ])
+    result = torch.zeros(len(tensor), dtype=torch.bool, device=device)
+    result[sort_idx[mask]] = True
+    return result
+
+
+class AFSSManager:
+    """Anti-Forgetting Sampling Strategy manager (improved version).
+
+    Key improvements over v1:
+    1. Dynamic sampling ratios: more data early, harder focus later.
+    2. Multi-threshold AP for sufficiency instead of single-threshold P/R.
+    3. Negative samples treated as moderate (not easy) to avoid over-suppression.
+    4. Minimum per-epoch coverage guarantee so training never drops too low.
+    5. Decoupled evaluate_and_update so caller can run it *before* get_epoch_subset.
+    6. All precision computations run on GPU to avoid CPU-GPU transfer overhead.
     """
 
     def __init__(
         self,
         num_samples: int,
-        easy_frac: float = 0.02,
-        moderate_frac: float = 0.4,
+        easy_frac: float = 0.15,
+        moderate_frac: float = 0.7,
         forced_mod_gap: int = 3,
         forced_easy_gap: int = 10,
+        min_coverage: float = 0.60,
+        total_epochs: Optional[int] = None,
     ):
         self.num_samples = int(num_samples)
         self.easy_frac = float(easy_frac)
         self.moderate_frac = float(moderate_frac)
         self.forced_mod_gap = int(forced_mod_gap)
         self.forced_easy_gap = int(forced_easy_gap)
-        # initialize state: P,R in [0,1], ep last epoch updated
-        self.state_dict = {i: {"P": 0.0, "R": 0.0, "ep": -1} for i in range(self.num_samples)}
-        # IoU thresholds used for matching (mAP-style 10 thresholds by default)
+        self.min_coverage = float(min_coverage)
+        self.total_epochs = int(total_epochs) if total_epochs else None
+
+        # state: sufficiency in [0,1], ep = last epoch this sample was trained
+        self.state_dict = {i: {"suff": 0.0, "ep": -1} for i in range(self.num_samples)}
+
+        # IoU thresholds (mAP-style 10 thresholds)
         self.iouv = torch.linspace(0.5, 0.95, 10)
         self.device = None
 
-    
+    def _get_dynamic_fracs(self, progress_ratio: float):
+        """Return (easy_frac, moderate_frac) scaled by training progress.
+
+        Early epochs: keep more data so the model learns a stable baseline.
+        Late epochs: gradually reduce to focus on hard cases.
+        """
+        p = float(np.clip(progress_ratio, 0.0, 1.0))
+        # easy:  start at full easy_frac, decay to 30% of it by end
+        e = self.easy_frac * (1.0 - 0.70 * p)
+        # moderate: start at full moderate_frac, decay to 50% of it by end
+        m = self.moderate_frac * (1.0 - 0.50 * p)
+        return e, m
+
     def _prepare_batch(self, si, batch):
-        """
-        Prepare a batch of images and annotations for validation.
-
-        Args:
-            si (int): Batch index.
-            batch (dict): Batch data containing images and annotations.
-
-        Returns:
-            (dict): Prepared batch with processed annotations.
-        """
+        """Prepare a batch of images and annotations for validation."""
         idx = batch["batch_idx"] == si
         cls = batch["cls"][idx].squeeze(-1)
         bbox = batch["bboxes"][idx]
-        
-        # 2. 这里的 device 统一引用 bbox.device
+
         device = bbox.device
         dtype = bbox.dtype
 
-        # 3. 处理 imgsz（注意：imgsz 只需创建一次）
         imgsz = torch.tensor(batch["img"].shape[2:], device=device, dtype=dtype)
-        
-        # 4. 处理其他元数据 (如果 batch["ori_shape"] 等是 list，则用 torch.as_tensor 更快)
         ori_shape = torch.as_tensor(batch["ori_shape"][si], device=device, dtype=dtype)
         ratio_pad = torch.as_tensor(batch["ratio_pad"][si], device=device, dtype=dtype)
 
         if len(cls):
-            
-            # 使用 imgsz[[1, 0, 1, 0]] 获取缩放系数
-            bbox = ops.xywh2xyxy(bbox) * imgsz[[1, 0, 1, 0]]  
-            
-            # 将坐标缩放到原始图像尺寸
-            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad) 
-            
+            bbox = ops.xywh2xyxy(bbox) * imgsz[[1, 0, 1, 0]]
+            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)
+
         return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
-    
+
     def _prepare_pred(self, pred, pbatch):
-        """
-        Prepare predictions for evaluation against ground truth.
-
-        Args:
-            pred (torch.Tensor): Model predictions.
-            pbatch (dict): Prepared batch information.
-
-        Returns:
-            (torch.Tensor): Prepared predictions in native space.
-        """
+        """Prepare predictions for evaluation against ground truth."""
         predn = pred.clone()
         ops.scale_boxes(
             pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
-        )  # native-space pred
+        )
         return predn
-    
+
     def match_predictions(
         self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
     ) -> torch.Tensor:
-        """
-        Match predictions to ground truth objects using IoU.
+        """Match predictions to ground truth objects using IoU. Entirely on GPU."""
+        n_dets = pred_classes.shape[0]
+        n_iou = self.iouv.shape[0]
+        device = pred_classes.device
 
-        Args:
-            pred_classes (torch.Tensor): Predicted class indices of shape (N,).
-            true_classes (torch.Tensor): Target class indices of shape (M,).
-            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground truth.
-            use_scipy (bool): Whether to use scipy for matching (more precise).
+        correct = torch.zeros((n_dets, n_iou), dtype=torch.bool, device=device)
+        correct_class = (true_classes[:, None] == pred_classes).to(device)
+        iou = iou * correct_class
 
-        Returns:
-            (torch.Tensor): Correct tensor of shape (N, 10) for 10 IoU thresholds.
-        """
-        # Dx10 matrix, where D - detections, 10 - IoU thresholds
-        correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
-        # LxD matrix where L - labels (rows), D - detections (columns)
-        correct_class = true_classes[:, None] == pred_classes
-        iou = iou * correct_class  # zero out the wrong classes
-        iou = iou.cpu().numpy()
-        for i, threshold in enumerate(self.iouv.cpu().tolist()):
+        for i, threshold in enumerate(self.iouv.tolist()):
             if use_scipy:
-                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-                import scipy  # scope import to avoid importing for all commands
-
-                cost_matrix = iou * (iou >= threshold)
+                import scipy
+                iou_np = iou.cpu().numpy()
+                cost_matrix = iou_np * (iou_np >= threshold)
                 if cost_matrix.any():
                     labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix)
                     valid = cost_matrix[labels_idx, detections_idx] > 0
                     if valid.any():
                         correct[detections_idx[valid], i] = True
             else:
-                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
-                matches = np.array(matches).T
+                matches = torch.nonzero(iou >= threshold, as_tuple=False)
                 if matches.shape[0]:
                     if matches.shape[0] > 1:
-                        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                        # matches = matches[matches[:, 2].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-                    correct[matches[:, 1].astype(int), i] = True
-        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+                        match_ious = iou[matches[:, 0], matches[:, 1]]
+                        order = torch.argsort(match_ious, descending=True)
+                        matches = matches[order]
+
+                        mask1 = _unique_first(matches[:, 1])
+                        matches = matches[mask1]
+                        mask2 = _unique_first(matches[:, 0])
+                        matches = matches[mask2]
+
+                    correct[matches[:, 1].long(), i] = True
+
+        return correct
 
     def _process_batch(self, detections, gt_bboxes, gt_cls):
-        """
-        Return correct prediction matrix.
-
-        Args:
-            detections (torch.Tensor): Tensor of shape (N, 6) representing detections where each detection is
-                (x1, y1, x2, y2, conf, class).
-            gt_bboxes (torch.Tensor): Tensor of shape (M, 4) representing ground-truth bounding box coordinates. Each
-                bounding box is of the format: (x1, y1, x2, y2).
-            gt_cls (torch.Tensor): Tensor of shape (M,) representing target class indices.
-
-        Returns:
-            (torch.Tensor): Correct prediction matrix of shape (N, 10) for 10 IoU levels.
-        """
+        """Return correct prediction matrix."""
         iou = box_iou(gt_bboxes, detections[:, :4])
         return self.match_predictions(detections[:, 5], gt_cls, iou)
-            
+
+    @staticmethod
+    def _compute_ap_torch(recall: torch.Tensor, precision: torch.Tensor) -> float:
+        """Compute AP using 101-point interpolation, entirely on GPU."""
+        device = recall.device
+        mrec = torch.cat([torch.zeros(1, device=device), recall, torch.ones(1, device=device)])
+        mpre = torch.cat([torch.ones(1, device=device), precision, torch.zeros(1, device=device)])
+
+        mpre = torch.flip(torch.cummax(torch.flip(mpre, dims=[0]), dim=0).values, dims=[0])
+
+        x = torch.linspace(0, 1, 101, device=device)
+        indices = torch.searchsorted(mrec, x, right=True) - 1
+        indices = torch.clamp(indices, 0, len(mpre) - 1)
+        y = mpre[indices]
+
+        dx = x[1] - x[0]
+        ap = (y[1:] + y[:-1]).sum() * 0.5 * dx
+        return ap.item()
+
     def get_epoch_subset(self, current_epoch: int) -> List[int]:
-        """Return list of indices (omega) for training this epoch and update ep for chosen indices."""
+        """Return list of indices (omega) for training this epoch."""
+        progress = current_epoch / self.total_epochs if self.total_epochs else 0.0
+        easy_frac_dyn, moderate_frac_dyn = self._get_dynamic_fracs(progress)
+
         omega = set()
         easy_pool, moderate_pool, hard_pool = [], [], []
         for img_id, state in self.state_dict.items():
-            sufficiency = min(state["P"], state["R"])
-            if sufficiency > 0.85:
+            suff = state["suff"]
+            if suff > 0.85:
                 easy_pool.append(img_id)
-            elif 0.55 <= sufficiency <= 0.85:
+            elif 0.55 <= suff <= 0.85:
                 moderate_pool.append(img_id)
             else:
                 hard_pool.append(img_id)
@@ -182,39 +203,47 @@ class AFSSManager:
         # 1. Include all hard
         omega.update(hard_pool)
 
-        # 2. Forced moderate (forgotten > forced_mod_gap)
+        # 2. Forced moderate
         forced_mod = [img for img in moderate_pool if current_epoch - 1 - self.state_dict[img]["ep"] >= self.forced_mod_gap]
         omega.update(forced_mod)
 
-        # 3. Supplement moderate up to moderate_frac
+        # 3. Supplement moderate
         remain_mod = list(set(moderate_pool) - set(forced_mod))
-        M1 = max(0, int(self.moderate_frac * len(moderate_pool)) - len(forced_mod))
+        M1 = max(0, int(moderate_frac_dyn * len(moderate_pool)) - len(forced_mod))
         if M1 > 0 and remain_mod:
             omega.update(random.sample(remain_mod, min(M1, len(remain_mod))))
 
-        # 4. Forced easy (forgotten > forced_easy_gap), capped
+        # 4. Forced easy
         forced_easy = [img for img in easy_pool if current_epoch - 1 - self.state_dict[img]["ep"] >= self.forced_easy_gap]
-        max_forced_easy = int(0.5 * self.easy_frac * len(easy_pool)) if len(easy_pool) > 0 else 0
+        max_forced_easy = int(0.5 * easy_frac_dyn * len(easy_pool)) if len(easy_pool) > 0 else 0
         if len(forced_easy) > max_forced_easy and max_forced_easy > 0:
             forced_easy = random.sample(forced_easy, max_forced_easy)
         omega.update(forced_easy)
 
-        # 5. Supplement easy to reach easy_frac
+        # 5. Supplement easy
         remain_easy = list(set(easy_pool) - set(forced_easy))
-        E2 = max(0, int(self.easy_frac * len(easy_pool)) - len(forced_easy))
+        E2 = max(0, int(easy_frac_dyn * len(easy_pool)) - len(forced_easy))
         if E2 > 0 and remain_easy:
             omega.update(random.sample(remain_easy, min(E2, len(remain_easy))))
 
-        # 6. Update epoch record
+        # 6. Minimum coverage guarantee
+        min_size = max(1, int(self.min_coverage * self.num_samples))
+        if len(omega) < min_size:
+            not_selected = [i for i in range(self.num_samples) if i not in omega]
+            need = min_size - len(omega)
+            if not_selected and need > 0:
+                omega.update(random.sample(not_selected, min(need, len(not_selected))))
+
+        # 7. Update epoch record
         for img_id in omega:
             self.state_dict[img_id]["ep"] = current_epoch
 
         return list(omega)
 
-    def print_sufficiency_distribution(self):
+    def print_sufficiency_distribution(self, current_epoch: Optional[int] = None):
         easy, mod, hard = 0, 0, 0
         for s in self.state_dict.values():
-            suff = min(s["P"], s["R"])
+            suff = s["suff"]
             if suff > 0.85:
                 easy += 1
             elif 0.55 <= suff <= 0.85:
@@ -228,106 +257,101 @@ class AFSSManager:
         LOGGER.info(f"  -> Easy     (>0.85): {easy:5d} / {total} ({easy/total*100:.1f}%)")
         LOGGER.info(f"  -> Moderate (0.55-0.85): {mod:5d} / {total} ({mod/total*100:.1f}%)")
         LOGGER.info(f"  -> Hard     (<0.55): {hard:5d} / {total} ({hard/total*100:.1f}%)")
-
+        if current_epoch is not None:
+            omega = self.get_epoch_subset(current_epoch)
+            LOGGER.info(f"  -> Selected this epoch: {len(omega):5d} / {total} ({len(omega)/total*100:.1f}%)")
 
     @torch.no_grad()
     def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5):
-        """Run inference over dataloader and update P,R for each image index.
-
-        Notes:
-            - dataloader should yield batches with keys: 'img', 'bboxes', 'batch_idx'
-            - GT format is expected to be normalized xywh in `batch['bboxes']`
-            - model(...) should return ultralytics-like Results per image (or a list/iterable)
-        """
+        """Run inference over dataloader and update sufficiency for each image index."""
         pbar = TQDM(dataloader, total=len(dataloader), desc="AFSS Evaluating")
         model.eval()
 
-        # set device and ensure iou vector exists
         self.device = next(model.parameters()).device
         if not hasattr(self, "iouv") or self.iouv is None:
             self.iouv = torch.linspace(0.5, 0.95, 10)
+        self.iouv = self.iouv.to(self.device)
 
-        # dataset reference for mapping image file -> global index
         dataset = getattr(dataloader, "dataset", None)
 
-        seen = 0
-        for si, batch in enumerate(pbar):
-            # 将数据移动到gpu上面
+
+        file_to_idx = {}
+        stem_to_idx = {}
+        if dataset is not None and hasattr(dataset, "im_files"):
+            for idx, f in enumerate(dataset.im_files):
+                f_str = str(f)
+                file_to_idx[f_str] = idx
+                stem_to_idx[Path(f_str).stem] = idx
+
+        for _, batch in enumerate(pbar):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device=self.device, non_blocking=True)
             imgs = batch["img"].to(dtype=next(model.parameters()).dtype) / 255.0
-            
-            # model output: normalize to per-image iterable
+
             preds = model(imgs)
             per_image_preds = ops.non_max_suppression(preds, conf_thresh, iou_thresh)
 
             for i, pred in enumerate(per_image_preds):
-                seen += 1
                 npr = len(pred)
 
                 pbatch = self._prepare_batch(i, batch)
                 cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
-                # bbox = bbox.to(self.device)
-                # cls = cls.to(self.device)
                 predn = self._prepare_pred(pred, pbatch)
 
-                # 处理负样本
                 ngt = int(len(cls))
-                if ngt == 0:
-                    if npr == 0:
-                        self.state_dict[img_id]["P"] = 1.0
-                        self.state_dict[img_id]["R"] = 1.0
 
-                    else:
-                        # 如果模型在背景图上产生了误报 (npr>0)，精确率为 0
-                        self.state_dict[img_id]["P"] = 0.0
-                        self.state_dict[img_id]["R"] = 1.0 # 负样本不存在漏检，R 可设为 1
-
-                    continue
-
-                # compute true positives matrix for all IoU thresholds
-                if npr == 0:
-                    tp_count = 0
-                else:
-                    correct = self._process_batch(predn, bbox, cls)  # (npr, n_iou)
-                    # pick the IoU threshold nearest to iou_thresh
-                    thr_idx = int((self.iouv.cpu() - float(iou_thresh)).abs().argmin().item())
-                    tp_count = int(correct[:, thr_idx].sum().item())
-
-                fp = max(0, npr - tp_count)
-                fn = max(0, ngt - tp_count)
-
-                P = tp_count / (tp_count + fp) if (tp_count + fp) > 0 else 0.0
-                R = tp_count / (tp_count + fn) if (tp_count + fn) > 0 else 0.0
-
-                # map batch image -> global image id using image file list when available
+                # =====================================================================
+                # 🚀 性能优化：通过 Dict.get() 代替原来的 List.index() 与双重循环
+                # =====================================================================
                 img_id = None
                 if "im_file" in batch:
-                    try:
-                        im_file = batch["im_file"][i]
-                        # normalize to str for matching
-                        im_file_s = str(im_file)
-                        if dataset is not None and hasattr(dataset, "im_files"):
-                            try:
-                                img_id = int(dataset.im_files.index(im_file_s))
-                            except ValueError:
-                                # sometimes im_file may already be a Path or differ in formatting
-                                # try matching by stem (filename without suffix)
-                                from pathlib import Path
+                    im_file_s = str(batch["im_file"][i])
+                    # 1. 尝试精确路径查找
+                    img_id = file_to_idx.get(im_file_s)
+                    # 2. 备用模糊 Stem 查找
+                    if img_id is None:
+                        img_id = stem_to_idx.get(Path(im_file_s).stem)
+                # =====================================================================
 
-                                stem = Path(im_file_s).stem
-                                for idx, f in enumerate(dataset.im_files):
-                                    if Path(f).stem == stem:
-                                        img_id = idx
-                                        break
-                    except Exception:
-                        img_id = None
+                if img_id is None or img_id not in self.state_dict:
+                    continue
 
-                # update AFSS state for this image if mapped
-                if img_id is not None and img_id in self.state_dict:
-                    self.state_dict[img_id]["P"] = float(P)
-                    self.state_dict[img_id]["R"] = float(R)
+                if ngt == 0:
+                    if npr == 0:
+                        self.state_dict[img_id]["suff"] = 0.55
+                    else:
+                        self.state_dict[img_id]["suff"] = 0.0
+                    continue
+
+                if npr == 0:
+                    self.state_dict[img_id]["suff"] = 0.0
+                    continue
+
+                correct = self._process_batch(predn, bbox, cls)
+                conf = predn[:, 4]
+
+                ap_per_iou = []
+                for j in range(correct.shape[1]):
+                    tpc = correct[:, j].float()
+                    if tpc.sum() == 0:
+                        ap_per_iou.append(0.0)
+                        continue
+
+                    order = torch.argsort(conf, descending=True)
+                    tpc_sorted = tpc[order]
+
+                    tpc_cumsum = torch.cumsum(tpc_sorted, dim=0)
+                    fpc_cumsum = torch.cumsum(1.0 - tpc_sorted, dim=0)
+
+                    recall = tpc_cumsum / ngt
+                    precision = tpc_cumsum / (tpc_cumsum + fpc_cumsum + 1e-16)
+
+                    ap = self._compute_ap_torch(recall, precision)
+                    ap_per_iou.append(ap)
+
+                sufficiency = float(np.mean(ap_per_iou))
+                self.state_dict[img_id]["suff"] = sufficiency
 
         model.train()
 
@@ -336,6 +360,7 @@ class AFSSIndexSampler(Sampler):
     """Simple sampler for single-process training: yields only active indices (shuffled)."""
 
     def __init__(self, num_samples: int, initial_indices: Optional[List[int]] = None, shuffle: bool = True):
+        super().__init__(None)
         self.num_samples = int(num_samples)
         self.active_indices = list(range(self.num_samples)) if initial_indices is None else list(initial_indices)
         self.shuffle = shuffle
@@ -354,27 +379,24 @@ class AFSSIndexSampler(Sampler):
 
 
 class AFSSDistributedSampler(Sampler):
-    """Sampler compatible with Distributed training that samples only from active_indices and shards per rank.
-
-    Behavior mirrors torch.utils.data.distributed.DistributedSampler but operates on a dynamic active_indices list.
-    """
+    """Sampler compatible with Distributed training that samples only from active_indices and shards per rank."""
 
     def __init__(
         self,
         dataset,
         active_indices: Optional[List[int]] = None,
         rank: Optional[int] = None,
-        world_size: int =1,
+        world_size: int = 1,
         shuffle: bool = True,
         seed: int = 0,
     ):
+        super().__init__(dataset)
         self.dataset = dataset
         self.shuffle = shuffle
-        self.rank = int(rank)
+        self.rank = int(rank) if rank is not None else 0
         self.world_size = int(world_size)
         self.seed = int(seed or 0)
         self.epoch = 0
-        # global active_indices (list of dataset indices)
         self.active_indices = list(active_indices) if active_indices is not None else list(range(len(dataset)))
         self.local_indices = []
         self._rebuild_local_indices()
@@ -384,11 +406,9 @@ class AFSSDistributedSampler(Sampler):
         if self.shuffle:
             rnd = random.Random(self.seed + self.epoch)
             rnd.shuffle(inds)
-        # slice by rank to distribute indices across processes
         self.local_indices = inds[self.rank::self.world_size]
 
     def set_active_indices(self, active_indices):
-        # active_indices is global list from AFSSManager (or None)
         if active_indices is None:
             return
         self.active_indices = list(active_indices)

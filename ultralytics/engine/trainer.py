@@ -354,8 +354,10 @@ class BaseTrainer:
                 if RANK in {-1, 0}:
                     self.afss_manager = AFSSManager(
                         num_samples=num_samples,
-                        easy_frac=getattr(self.args, 'afss_easy_frac', 0.02),
-                        moderate_frac=getattr(self.args, 'afss_moderate_frac', 0.4),
+                        easy_frac=getattr(self.args, 'afss_easy_frac', 0.15),
+                        moderate_frac=getattr(self.args, 'afss_moderate_frac', 0.7),
+                        min_coverage=getattr(self.args, 'afss_min_coverage', 0.60),
+                        total_epochs=self.epochs,
                     )
                     self.afss_eval_loader = self.get_dataloader(self.trainset, batch_size=min(batch_size * 2, 64), rank=-1, mode='val')
                 else:
@@ -415,7 +417,19 @@ class BaseTrainer:
             # ===== AFSS per-epoch update (insert start) =====
             if getattr(self, "afss_manager", None) or getattr(self, 'afss_eval_loader', None):
                 try:
-                    # Only rank 0 computes omega; broadcast to other ranks in DDP
+                    # Step 1: evaluate first so get_epoch_subset uses fresh P/R
+                    if RANK in {-1, 0} and getattr(self, 'afss_manager', None) \
+                            and (self.epoch % getattr(self.args, 'afss_interval', 5) == 0) \
+                            and (self.epoch != self.start_epoch):
+                        self.afss_manager.evaluate_and_update(
+                            self.model,
+                            self.afss_eval_loader,
+                            conf_thresh=getattr(self.args, 'afss_conf', 0.2),
+                            iou_thresh=getattr(self.args, 'afss_iou', 0.5)
+                        )
+                        self.afss_manager.print_sufficiency_distribution(current_epoch=self.epoch)
+
+                    # Step 2: compute omega with up-to-date sufficiency scores
                     omega = None
                     if RANK in {-1, 0} and getattr(self, 'afss_manager', None):
                         omega = self.afss_manager.get_epoch_subset(self.epoch)
@@ -447,16 +461,6 @@ class BaseTrainer:
                                 LOGGER.warning(f"AFSS: set_active_indices failed: {e}")
                         else:
                             LOGGER.warning("AFSS: sampler does not support set_active_indices.")
-
-                    # periodic evaluation update only on rank 0
-                    if RANK in {-1, 0} and getattr(self, 'afss_manager', None) and (self.epoch % getattr(self.args, 'afss_interval', 5) == 0) and (self.epoch != self.start_epoch):
-                        self.afss_manager.evaluate_and_update(
-                            self.model,
-                            self.afss_eval_loader,
-                            conf_thresh=getattr(self.args, 'afss_conf', 0.2),
-                            iou_thresh=getattr(self.args, 'afss_iou', 0.5)
-                        )
-                        self.afss_manager.print_sufficiency_distribution()
                 except Exception as e:
                     LOGGER.warning(f"AFSS per-epoch error: {e}")
             # ===== AFSS per-epoch update (insert end) =====
