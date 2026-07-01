@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import List, Optional
 import numpy as np
 import torch
+import torchvision.ops as tv_ops  # 新增：用于高效计算 IoU 矩阵
 from torch.utils.data import Sampler
 from ultralytics.utils import LOGGER, TQDM, ops
 from ultralytics.utils.metrics import box_iou
@@ -35,65 +36,57 @@ def _unique_first(tensor: torch.Tensor) -> torch.Tensor:
         mask: boolean tensor, True for first occurrence.
     """
     device = tensor.device
-    sorted_vals, sort_idx = torch.sort(tensor)
-    mask = torch.cat([
-        torch.ones(1, dtype=torch.bool, device=device),
-        sorted_vals[1:] != sorted_vals[:-1]
-    ])
+    # Use torch.unique with stable=True to get indices of the first occurrence
+    # in the original order (preserves GPU usage and avoids sorting-based bugs).
+    try:
+        _, first_idx = torch.unique(tensor, return_inverse=False, return_counts=False, return_index=True, stable=True)
+    except TypeError:
+        # Fallback for older PyTorch versions without `stable` argument: compute on CPU
+        vals_cpu = tensor.cpu().numpy()
+        seen = {}
+        mask_list = [False] * len(vals_cpu)
+        for i, v in enumerate(vals_cpu):
+            if v not in seen:
+                seen[v] = True
+                mask_list[i] = True
+        return torch.tensor(mask_list, dtype=torch.bool, device=device)
+
     result = torch.zeros(len(tensor), dtype=torch.bool, device=device)
-    result[sort_idx[mask]] = True
+    result[first_idx] = True
     return result
 
 
 class AFSSManager:
-    """Anti-Forgetting Sampling Strategy manager (improved version).
+    """Anti-Forgetting Sampling Strategy manager (P/R-based version).
 
-    Key improvements over v1:
+    Key design choices:
     1. Dynamic sampling ratios: more data early, harder focus later.
-    2. Multi-threshold AP for sufficiency instead of single-threshold P/R.
+    2. Single-threshold P/R (F1) for sufficiency — matches original AFSS paper.
+       Using fixed-IoU Precision & Recall avoids the instability of per-image AP.
     3. Negative samples treated as moderate (not easy) to avoid over-suppression.
     4. Minimum per-epoch coverage guarantee so training never drops too low.
     5. Decoupled evaluate_and_update so caller can run it *before* get_epoch_subset.
-    6. All precision computations run on GPU to avoid CPU-GPU transfer overhead.
+    6. All computations run on GPU to avoid CPU-GPU transfer overhead.
     """
 
     def __init__(
         self,
         num_samples: int,
-        easy_frac: float = 0.15,
-        moderate_frac: float = 0.7,
+        easy_frac: float = 0.02,
+        moderate_frac: float = 0.4,
         forced_mod_gap: int = 3,
         forced_easy_gap: int = 10,
-        min_coverage: float = 0.60,
-        total_epochs: Optional[int] = None,
     ):
         self.num_samples = int(num_samples)
         self.easy_frac = float(easy_frac)
         self.moderate_frac = float(moderate_frac)
         self.forced_mod_gap = int(forced_mod_gap)
         self.forced_easy_gap = int(forced_easy_gap)
-        self.min_coverage = float(min_coverage)
-        self.total_epochs = int(total_epochs) if total_epochs else None
 
         # state: sufficiency in [0,1], ep = last epoch this sample was trained
-        self.state_dict = {i: {"suff": 0.0, "ep": -1} for i in range(self.num_samples)}
+        self.state_dict = {i: {"P": 0.0,"R": 0.0, "ep": -1} for i in range(self.num_samples)}
 
-        # IoU thresholds (mAP-style 10 thresholds)
-        self.iouv = torch.linspace(0.5, 0.95, 10)
         self.device = None
-
-    def _get_dynamic_fracs(self, progress_ratio: float):
-        """Return (easy_frac, moderate_frac) scaled by training progress.
-
-        Early epochs: keep more data so the model learns a stable baseline.
-        Late epochs: gradually reduce to focus on hard cases.
-        """
-        p = float(np.clip(progress_ratio, 0.0, 1.0))
-        # easy:  start at full easy_frac, decay to 30% of it by end
-        e = self.easy_frac * (1.0 - 0.70 * p)
-        # moderate: start at full moderate_frac, decay to 50% of it by end
-        m = self.moderate_frac * (1.0 - 0.50 * p)
-        return e, m
 
     def _prepare_batch(self, si, batch):
         """Prepare a batch of images and annotations for validation."""
@@ -125,74 +118,57 @@ class AFSSManager:
     def match_predictions(
         self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
     ) -> torch.Tensor:
-        """Match predictions to ground truth objects using IoU. Entirely on GPU."""
-        n_dets = pred_classes.shape[0]
-        n_iou = self.iouv.shape[0]
-        device = pred_classes.device
+        """Match predictions to ground truth objects using IoU at a single threshold (0.5).
 
-        correct = torch.zeros((n_dets, n_iou), dtype=torch.bool, device=device)
+        Returns a bool tensor of shape (n_dets,) marking which detections are correct.
+        """
+        device = pred_classes.device
+        correct = torch.zeros(pred_classes.shape[0], dtype=torch.bool, device=device)
         correct_class = (true_classes[:, None] == pred_classes).to(device)
         iou = iou * correct_class
 
-        for i, threshold in enumerate(self.iouv.tolist()):
-            if use_scipy:
-                import scipy
-                iou_np = iou.cpu().numpy()
-                cost_matrix = iou_np * (iou_np >= threshold)
-                if cost_matrix.any():
-                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix)
-                    valid = cost_matrix[labels_idx, detections_idx] > 0
-                    if valid.any():
-                        correct[detections_idx[valid], i] = True
-            else:
-                matches = torch.nonzero(iou >= threshold, as_tuple=False)
-                if matches.shape[0]:
-                    if matches.shape[0] > 1:
-                        match_ious = iou[matches[:, 0], matches[:, 1]]
-                        order = torch.argsort(match_ious, descending=True)
-                        matches = matches[order]
+        if use_scipy:
+            import scipy
+            iou_np = iou.cpu().numpy()
+            cost_matrix = iou_np * (iou_np >= 0.5)
+            if cost_matrix.any():
+                labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix)
+                valid = cost_matrix[labels_idx, detections_idx] > 0
+                if valid.any():
+                    correct[detections_idx[valid]] = True
+        else:
+            matches = torch.nonzero(iou >= 0.5, as_tuple=False)
+            if matches.shape[0]:
+                if matches.shape[0] > 1:
+                    match_ious = iou[matches[:, 0], matches[:, 1]]
+                    order = torch.argsort(match_ious, descending=True)
+                    matches = matches[order]
 
-                        mask1 = _unique_first(matches[:, 1])
-                        matches = matches[mask1]
-                        mask2 = _unique_first(matches[:, 0])
-                        matches = matches[mask2]
+                    mask1 = _unique_first(matches[:, 1])
+                    matches = matches[mask1]
+                    mask2 = _unique_first(matches[:, 0])
+                    matches = matches[mask2]
 
-                    correct[matches[:, 1].long(), i] = True
+                correct[matches[:, 1].long()] = True
 
         return correct
 
     def _process_batch(self, detections, gt_bboxes, gt_cls):
-        """Return correct prediction matrix."""
+        """Return boolean vector marking which detections are correct (IoU>=0.5, class match)."""
         iou = box_iou(gt_bboxes, detections[:, :4])
         return self.match_predictions(detections[:, 5], gt_cls, iou)
 
-    @staticmethod
-    def _compute_ap_torch(recall: torch.Tensor, precision: torch.Tensor) -> float:
-        """Compute AP using 101-point interpolation, entirely on GPU."""
-        device = recall.device
-        mrec = torch.cat([torch.zeros(1, device=device), recall, torch.ones(1, device=device)])
-        mpre = torch.cat([torch.ones(1, device=device), precision, torch.zeros(1, device=device)])
-
-        mpre = torch.flip(torch.cummax(torch.flip(mpre, dims=[0]), dim=0).values, dims=[0])
-
-        x = torch.linspace(0, 1, 101, device=device)
-        indices = torch.searchsorted(mrec, x, right=True) - 1
-        indices = torch.clamp(indices, 0, len(mpre) - 1)
-        y = mpre[indices]
-
-        dx = x[1] - x[0]
-        ap = (y[1:] + y[:-1]).sum() * 0.5 * dx
-        return ap.item()
-
     def get_epoch_subset(self, current_epoch: int) -> List[int]:
-        """Return list of indices (omega) for training this epoch."""
-        progress = current_epoch / self.total_epochs if self.total_epochs else 0.0
-        easy_frac_dyn, moderate_frac_dyn = self._get_dynamic_fracs(progress)
-
+        """Return list of indices (omega) for training this epoch using AFSS."""
+        
         omega = set()
         easy_pool, moderate_pool, hard_pool = [], [], []
+
+        # ==========================================
+        # 1. 学习充分度评估与分类 (Eq. 2)
+        # ==========================================
         for img_id, state in self.state_dict.items():
-            suff = state["suff"]
+            suff = min(state["P"], state["R"])
             if suff > 0.85:
                 easy_pool.append(img_id)
             elif 0.55 <= suff <= 0.85:
@@ -200,41 +176,47 @@ class AFSSManager:
             else:
                 hard_pool.append(img_id)
 
-        # 1. Include all hard
+        # ==========================================
+        # 核心策略 1: 困难样本全量参与 (Full Coverage - Eq. 16)
+        # ==========================================
         omega.update(hard_pool)
 
-        # 2. Forced moderate
-        forced_mod = [img for img in moderate_pool if current_epoch - 1 - self.state_dict[img]["ep"] >= self.forced_mod_gap]
+        # ==========================================
+        # 核心策略 2: 简单样本持续复习 (Continuous Review - Eq. 3, 4, 5, 6)
+        # ==========================================
+        forced_easy = [
+            img for img in easy_pool
+            if (current_epoch - 1) - self.state_dict[img]["ep"] >= self.forced_easy_gap
+        ]
+        omega.update(forced_easy)
+        
+        total_easy_target = max(0, int(self.easy_frac * len(easy_pool)) - len(forced_easy))
+        
+        # 从剩余简单样本中随机采样，补齐到 easy 目标数量
+        remain_easy = list(set(easy_pool) - set(forced_easy))
+        total_easy_target = min(total_easy_target, len(remain_easy))
+        Ar = random.sample(remain_easy, total_easy_target) if total_easy_target > 0 else []
+        omega.update(Ar)
+
+        # ==========================================
+        # 核心策略 3: 中等样本短期覆盖 (Short-Term Coverage - Eq. 7, 8, 9)
+        # ==========================================
+        forced_mod = [
+            img for img in moderate_pool
+            if (current_epoch - 1) - self.state_dict[img]["ep"] >= self.forced_mod_gap
+        ]
         omega.update(forced_mod)
 
-        # 3. Supplement moderate
+        M1 = int(self.moderate_frac * len(moderate_pool)) - len(forced_mod)
+        M1 = max(0, M1)
         remain_mod = list(set(moderate_pool) - set(forced_mod))
-        M1 = max(0, int(moderate_frac_dyn * len(moderate_pool)) - len(forced_mod))
-        if M1 > 0 and remain_mod:
-            omega.update(random.sample(remain_mod, min(M1, len(remain_mod))))
+        M1 = min(M1, len(remain_mod))
+        Br = random.sample(remain_mod, M1) if M1 > 0 else []
+        omega.update(Br)
 
-        # 4. Forced easy
-        forced_easy = [img for img in easy_pool if current_epoch - 1 - self.state_dict[img]["ep"] >= self.forced_easy_gap]
-        max_forced_easy = int(0.5 * easy_frac_dyn * len(easy_pool)) if len(easy_pool) > 0 else 0
-        if len(forced_easy) > max_forced_easy and max_forced_easy > 0:
-            forced_easy = random.sample(forced_easy, max_forced_easy)
-        omega.update(forced_easy)
-
-        # 5. Supplement easy
-        remain_easy = list(set(easy_pool) - set(forced_easy))
-        E2 = max(0, int(easy_frac_dyn * len(easy_pool)) - len(forced_easy))
-        if E2 > 0 and remain_easy:
-            omega.update(random.sample(remain_easy, min(E2, len(remain_easy))))
-
-        # 6. Minimum coverage guarantee
-        min_size = max(1, int(self.min_coverage * self.num_samples))
-        if len(omega) < min_size:
-            not_selected = [i for i in range(self.num_samples) if i not in omega]
-            need = min_size - len(omega)
-            if not_selected and need > 0:
-                omega.update(random.sample(not_selected, min(need, len(not_selected))))
-
-        # 7. Update epoch record
+        # ==========================================
+        # 4. 状态更新 (State Update - Eq. 15)
+        # ==========================================
         for img_id in omega:
             self.state_dict[img_id]["ep"] = current_epoch
 
@@ -243,7 +225,7 @@ class AFSSManager:
     def print_sufficiency_distribution(self, current_epoch: Optional[int] = None):
         easy, mod, hard = 0, 0, 0
         for s in self.state_dict.values():
-            suff = s["suff"]
+            suff = min(s["P"], s["R"])
             if suff > 0.85:
                 easy += 1
             elif 0.55 <= suff <= 0.85:
@@ -257,23 +239,18 @@ class AFSSManager:
         LOGGER.info(f"  -> Easy     (>0.85): {easy:5d} / {total} ({easy/total*100:.1f}%)")
         LOGGER.info(f"  -> Moderate (0.55-0.85): {mod:5d} / {total} ({mod/total*100:.1f}%)")
         LOGGER.info(f"  -> Hard     (<0.55): {hard:5d} / {total} ({hard/total*100:.1f}%)")
-        if current_epoch is not None:
-            omega = self.get_epoch_subset(current_epoch)
-            LOGGER.info(f"  -> Selected this epoch: {len(omega):5d} / {total} ({len(omega)/total*100:.1f}%)")
 
     @torch.no_grad()
     def evaluate_and_update(self, model, dataloader, conf_thresh=0.2, iou_thresh=0.5):
         """Run inference over dataloader and update sufficiency for each image index."""
+
+        model_eval = model.module if hasattr(model, "module") else model
         pbar = TQDM(dataloader, total=len(dataloader), desc="AFSS Evaluating")
         model.eval()
 
-        self.device = next(model.parameters()).device
-        if not hasattr(self, "iouv") or self.iouv is None:
-            self.iouv = torch.linspace(0.5, 0.95, 10)
-        self.iouv = self.iouv.to(self.device)
+        self.device = next(model_eval.parameters()).device
 
         dataset = getattr(dataloader, "dataset", None)
-
 
         file_to_idx = {}
         stem_to_idx = {}
@@ -289,7 +266,7 @@ class AFSSManager:
                     batch[k] = v.to(device=self.device, non_blocking=True)
             imgs = batch["img"].to(dtype=next(model.parameters()).dtype) / 255.0
 
-            preds = model(imgs)
+            preds = model_eval(imgs)
             per_image_preds = ops.non_max_suppression(preds, conf_thresh, iou_thresh)
 
             for i, pred in enumerate(per_image_preds):
@@ -317,41 +294,81 @@ class AFSSManager:
                 if img_id is None or img_id not in self.state_dict:
                     continue
 
+                # 场景 1：无 Ground Truth (背景图)
                 if ngt == 0:
                     if npr == 0:
-                        self.state_dict[img_id]["suff"] = 0.55
+                        # 既没物体也没预测：完美
+                        self.state_dict[img_id]["P"] = 1.0
+                        self.state_dict[img_id]["R"] = 1.0
                     else:
-                        self.state_dict[img_id]["suff"] = 0.0
+                        # 没物体却预测了：全是误报 (FP)
+                        self.state_dict[img_id]["P"] = 0.0
+                        self.state_dict[img_id]["R"] = 0.0
                     continue
 
+                # 场景 2：有 Ground Truth 但模型一个框都没预测出来 (全漏检)
                 if npr == 0:
-                    self.state_dict[img_id]["suff"] = 0.0
+                    self.state_dict[img_id]["P"] = 0.0
+                    self.state_dict[img_id]["R"] = 0.0
                     continue
+                    
+                # =====================================================================
+                # 场景 3：严谨的基于类别和 IoU 的一对一匹配 (修正了 P、R 的计算)
+                # =====================================================================
+                TP = 0
+                FP = 0
+                FN = 0
 
-                correct = self._process_batch(predn, bbox, cls)
-                conf = predn[:, 4]
+                pred_classes = predn[:, 5]
+                gt_classes = cls.view(-1)
+                
+                # 获取该图片中出现的所有类别 (预测类并集真实类)
+                unique_classes = torch.unique(torch.cat([pred_classes, gt_classes]))
 
-                ap_per_iou = []
-                for j in range(correct.shape[1]):
-                    tpc = correct[:, j].float()
-                    if tpc.sum() == 0:
-                        ap_per_iou.append(0.0)
+                for c in unique_classes:
+                    mask_p = (pred_classes == c)
+                    mask_g = (gt_classes == c)
+                    
+                    p_boxes = predn[mask_p, :4]
+                    g_boxes = bbox[mask_g]
+                    
+                    n_p = len(p_boxes)
+                    n_g = len(g_boxes)
+                    
+                    if n_p == 0:
+                        # 预测无该类，但 GT 有 -> 全是漏检
+                        FN += n_g
                         continue
+                        
+                    if n_g == 0:
+                        # 预测有该类，但 GT 无 -> 全是误报
+                        FP += n_p
+                        continue
+                        
+                    # 计算 IoU 矩阵
+                    ious = tv_ops.box_iou(p_boxes, g_boxes)
+                    
+                    matched_gts = set()
+                    
+                    # 贪心匹配 (按预测框的顺序，NMS结果默认是按置信度降序的)
+                    for p_idx in range(n_p):
+                        max_iou, max_g_idx = ious[p_idx].max(dim=0)
+                        max_g_idx_val = max_g_idx.item()
+                        
+                        if max_iou >= iou_thresh and max_g_idx_val not in matched_gts:
+                            matched_gts.add(max_g_idx_val)
+                            TP += 1
+                        else:
+                            FP += 1
+                            
+                    # GT中未被匹配掉的数量，即为漏检
+                    FN += (n_g - len(matched_gts))
 
-                    order = torch.argsort(conf, descending=True)
-                    tpc_sorted = tpc[order]
+                P = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+                R = TP / (TP + FN) if (TP + FN) > 0 else 0.0
 
-                    tpc_cumsum = torch.cumsum(tpc_sorted, dim=0)
-                    fpc_cumsum = torch.cumsum(1.0 - tpc_sorted, dim=0)
-
-                    recall = tpc_cumsum / ngt
-                    precision = tpc_cumsum / (tpc_cumsum + fpc_cumsum + 1e-16)
-
-                    ap = self._compute_ap_torch(recall, precision)
-                    ap_per_iou.append(ap)
-
-                sufficiency = float(np.mean(ap_per_iou))
-                self.state_dict[img_id]["suff"] = sufficiency
+                self.state_dict[img_id]["P"] = P
+                self.state_dict[img_id]["R"] = R
 
         model.train()
 

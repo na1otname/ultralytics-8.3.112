@@ -176,3 +176,8 @@ pnnx*
 calibration_*.npy
 main.py
 .claude
+
+uv.lock
+test.py
+train.py
+export.py

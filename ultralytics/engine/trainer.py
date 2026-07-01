@@ -318,50 +318,31 @@ class BaseTrainer:
                     afss_sampler = AFSSIndexSampler(num_samples, initial_indices=list(range(num_samples)))
 
                 # Attempt to inject sampler into existing DataLoader's underlying sampler (preferred)
-                injected = False
-                try:
-                    bs = getattr(self.train_loader, 'batch_sampler', None)
-                    if bs is not None:
-                        # _RepeatSampler -> .sampler is underlying BatchSampler
-                        underlying_bs = getattr(bs, 'sampler', bs)
-                        if hasattr(underlying_bs, 'sampler'):
-                            underlying_bs.sampler = afss_sampler
-                            injected = True
-                    if not injected:
-                        # fallback: set DataLoader.sampler
-                        setattr(self.train_loader, 'sampler', afss_sampler)
-                        injected = True
-                except Exception as e:
-                    LOGGER.warning(f"AFSS: injection to existing DataLoader failed: {e}")
+                from ultralytics.data.build import build_dataloader
 
-                if not injected:
-                    # rebuild dataloader with our sampler
-                    try:
-                        from ultralytics.data.build import build_dataloader
+                self.train_loader = build_dataloader(
+                    dataset=self.train_loader.dataset,
+                    batch=batch_size,
+                    workers=self.args.workers,
+                    shuffle=True,
+                    rank=LOCAL_RANK,
+                    sampler=afss_sampler,  # 显式传入你的自定义采样器
+                )
 
-                        self.train_loader = build_dataloader(
-                            self.train_loader.dataset,
-                            self.batch_size,
-                            self.args.workers,
-                            shuffle=True,
-                            rank=LOCAL_RANK,
-                            sampler=afss_sampler,
-                        )
-                    except Exception as e:
-                        LOGGER.warning(f"AFSS: rebuild train_loader failed: {e}")
-
-                # Only rank 0 (or single-process) holds the AFSSManager and eval loader
+                # 3. 只有主进程（rank 0）或单卡训练时，实例化管理器与评估加载器
                 if RANK in {-1, 0}:
                     self.afss_manager = AFSSManager(
                         num_samples=num_samples,
                         easy_frac=getattr(self.args, 'afss_easy_frac', 0.15),
                         moderate_frac=getattr(self.args, 'afss_moderate_frac', 0.7),
-                        min_coverage=getattr(self.args, 'afss_min_coverage', 0.60),
-                        total_epochs=self.epochs,
+                        # min_coverage=getattr(self.args, 'afss_min_coverage', 0.60),
+                        # total_epochs=self.epochs,
                     )
                     self.afss_eval_loader = self.get_dataloader(self.trainset, batch_size=min(batch_size * 2, 64), rank=-1, mode='val')
                 else:
                     self.afss_manager = None
+                    self.afss_eval_loader = None
+                    
             except Exception as e:
                 LOGGER.warning(f"AFSS initialization failed: {e}")
                 self.afss_manager = None
@@ -414,13 +395,18 @@ class BaseTrainer:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
             
-            # ===== AFSS per-epoch update (insert start) =====
-            if getattr(self, "afss_manager", None) or getattr(self, 'afss_eval_loader', None):
+            # if getattr(self, "afss_manager", None) or getattr(self, 'afss_eval_loader', None):
+            if getattr(self.args, "afss", False):
                 try:
-                    # Step 1: evaluate first so get_epoch_subset uses fresh P/R
-                    if RANK in {-1, 0} and getattr(self, 'afss_manager', None) \
-                            and (self.epoch % getattr(self.args, 'afss_interval', 5) == 0) \
-                            and (self.epoch != self.start_epoch):
+                    # 1. 定义严格的 AFSS 预热期（例如 30 个 Epoch），前 30 轮不裁剪任何数据
+                    afss_warmup_epochs = getattr(self.args, 'afss_warmup_epochs', 30)
+                    
+                    # 2. 只有过了预热期，且满足设定的间隔（如每5轮），才执行评估
+                    if RANK in {-1, 0}  and getattr(self, 'afss_manager', None) \
+                            and self.epoch >= afss_warmup_epochs \
+                            and ((self.epoch - afss_warmup_epochs) % getattr(self.args, 'afss_interval', 5) == 0):
+                        
+                        LOGGER.info(f"AFSS: Refreshing Precision and Recall at epoch {self.epoch}...")
                         self.afss_manager.evaluate_and_update(
                             self.model,
                             self.afss_eval_loader,
@@ -429,18 +415,24 @@ class BaseTrainer:
                         )
                         self.afss_manager.print_sufficiency_distribution(current_epoch=self.epoch)
 
-                    # Step 2: compute omega with up-to-date sufficiency scores
+                    # 3. 计算本轮训练的样本子集 omega
                     omega = None
                     if RANK in {-1, 0} and getattr(self, 'afss_manager', None):
-                        omega = self.afss_manager.get_epoch_subset(self.epoch)
+                        if self.epoch >= afss_warmup_epochs: 
+                            # 过了预热期，按论文策略动态裁剪
+                            omega = self.afss_manager.get_epoch_subset(self.epoch)
+                        else:
+                            # 预热期内，保底使用 100% 全量数据
+                            omega = list(range(self.afss_manager.num_samples))
+
 
                     if world_size > 1:
                         obj = [omega] if RANK == 0 else [None]
                         dist.broadcast_object_list(obj, src=0)
                         omega = obj[0]
 
+                    # 4. 应用子集到 Sampler
                     if omega is not None:
-                        # find base sampler (BatchSampler.sampler -> base sampler)
                         bs = getattr(self.train_loader, 'batch_sampler', None)
                         base_sampler = None
                         if bs is not None:
@@ -453,17 +445,18 @@ class BaseTrainer:
                             base_sampler = getattr(self.train_loader, 'sampler', None)
 
                         if hasattr(base_sampler, 'set_active_indices'):
-                            try:
-                                base_sampler.set_active_indices(omega)
-                                if hasattr(base_sampler, 'set_epoch'):
-                                    base_sampler.set_epoch(self.epoch)
-                            except Exception as e:
-                                LOGGER.warning(f"AFSS: set_active_indices failed: {e}")
+                            base_sampler.set_active_indices(omega)
+                            if hasattr(base_sampler, 'set_epoch'):
+                                base_sampler.set_epoch(self.epoch)
                         else:
                             LOGGER.warning("AFSS: sampler does not support set_active_indices.")
+                            
                 except Exception as e:
+                    # 打印详细的报错堆栈，不要漏掉任何蛛丝马迹
+                    import traceback
                     LOGGER.warning(f"AFSS per-epoch error: {e}")
-            # ===== AFSS per-epoch update (insert end) =====
+                    LOGGER.warning(traceback.format_exc())
+            # ===== AFSS per-epoch update (修复版结束) =====
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
